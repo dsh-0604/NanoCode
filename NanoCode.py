@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
     QCompleter, QComboBox, QLabel, QVBoxLayout, QHBoxLayout,
     QWidget, QFileDialog, QMessageBox, QLineEdit, QPushButton, QSplitter,
     QStyledItemDelegate, QListWidget, QListWidgetItem, QDialog, QStyle,
-    QGraphicsOpacityEffect, QInputDialog
+    QGraphicsOpacityEffect, QInputDialog, QTabWidget
 )
 from PySide6.QtGui import (
     QFont, QColor, QTextCharFormat, QSyntaxHighlighter, QPainter,
@@ -61,7 +61,7 @@ DEFAULT_TEMPLATE = (
 
 # ==================== 自动扫描头文件补充词库 ====================
 EXTRA_FUNCTIONS = set()
-_FUNC_RE = re.compile(r"\b([a-zA-Z_]\w*)\s*\\(")
+_FUNC_RE = re.compile(r"\b([a-zA-Z_]\w*)\s*\(")
 
 def scan_arduino_headers():
     dirs = [FRAMEWORK_CORES]
@@ -191,7 +191,7 @@ class CppHighlighter(QSyntaxHighlighter):
             r"\b(" + "|".join(k for k, _ in KW.CORE_KEYWORDS) + r")\b"), kw))
         func = QTextCharFormat()
         func.setForeground(QColor("#61afef"))
-        self.rules.append((re.compile(r"\b[A-Za-z_]\w*(?=\s*\\("), func))
+        self.rules.append((re.compile(r"\b[A-Za-z_]\w*(?=\s*\("), func))
         num = QTextCharFormat()
         num.setForeground(QColor("#d19a66"))
         self.rules.append((re.compile(r"\b\d+\.?\d*[fF]?\b"), num))
@@ -777,17 +777,14 @@ class MainWindow(QMainWindow):
         self.serial = QSerialPort(self)
         self.serial.readyRead.connect(self.onSerialData)
 
-        # ---- 编辑器 ----
-        self.editor = CodeEditor()
-        self.editor.errorLines = []
-        self.editor.semiLines = []
-        self.editor.textChanged.connect(self.onEditorTextChanged)
-        font = QFont("Consolas", 13)
-        font.setStyleHint(QFont.Monospace)
-        self.editor.setFont(font)
-        self.editor.setStyleSheet(
-            "QPlainTextEdit{background:#282c34;color:#abb2bf;border:none;}")
-        self.highlighter = CppHighlighter(self.editor.document())
+        # ---- 编辑器区：多文件标签（像小熊猫/PyCharm 一样来回切） ----
+        self.tabs = QTabWidget()
+        self.tabs.setTabsClosable(True)
+        self.tabs.setDocumentMode(True)
+        self.tabs.setMovable(True)
+        self.tabs.tabCloseRequested.connect(self.closeTab)
+        self.tabs.currentChanged.connect(self.onTabChanged)
+        self._newEditorTab("未命名", None)
 
         # ---- 输出面板 ----
         self.output = QTextBrowser()
@@ -812,7 +809,7 @@ class MainWindow(QMainWindow):
         ol.addWidget(self.output)
 
         splitter = QSplitter(Qt.Vertical)
-        splitter.addWidget(self.editor)
+        splitter.addWidget(self.tabs)
         splitter.addWidget(outWrap)
         splitter.setSizes([540, 200])
         splitter.setHandleWidth(9)
@@ -887,6 +884,69 @@ class MainWindow(QMainWindow):
         self.refreshPorts()
         self.loadDemoIfEmpty()
 
+    @property
+    def editor(self):
+        """当前标签页的编辑器（老代码都用 self.editor，保持兼容）"""
+        return self.tabs.currentWidget()
+
+    def _newEditorTab(self, title, path=None):
+        """开一个新标签页，里面放一个独立编辑器（每个文件各占一个）"""
+        ed = CodeEditor()
+        ed.errorLines = []
+        ed.semiLines = []
+        ed.filePath = path
+        ed.textChanged.connect(self.onEditorTextChanged)
+        font = QFont("Consolas", 13)
+        font.setStyleHint(QFont.Monospace)
+        ed.setFont(font)
+        ed.setStyleSheet(
+            "QPlainTextEdit{background:#282c34;color:#abb2bf;border:none;}")
+        CppHighlighter(ed.document())
+        self.tabs.addTab(ed, title)
+        self.tabs.setCurrentWidget(ed)
+        return ed
+
+    def onTabChanged(self, idx):
+        ed = self.tabs.widget(idx)
+        if ed is None:
+            return
+        self.currentFile = getattr(ed, "filePath", None)
+        # 窗口还没搭完时（状态栏未创建）不刷状态，避免启动报错
+        if not hasattr(self, "statusLabel"):
+            return
+        if self.currentFile:
+            self.statusLabel.setText(os.path.basename(self.currentFile))
+        else:
+            self.statusLabel.setText(self.tabs.tabText(idx) + "（还没存盘，点保存会先起名）")
+
+    def closeTab(self, idx):
+        ed = self.tabs.widget(idx)
+        if ed is None:
+            return
+        p = getattr(ed, "filePath", None)
+        dirty = False
+        if p and os.path.isfile(p):
+            with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                dirty = f.read() != ed.toPlainText()
+        elif ed.toPlainText().strip():
+            dirty = True   # 还没命名但有内容
+        if dirty:
+            r = QMessageBox.question(
+                self, "内容没保存",
+                f"「{self.tabs.tabText(idx)}」有改动没保存，要现在保存吗？",
+                QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+                QMessageBox.Save)
+            if r == QMessageBox.Cancel:
+                return
+            if r == QMessageBox.Save:
+                self.saveFile()
+        i2 = self.tabs.indexOf(ed)
+        if i2 >= 0:
+            self.tabs.removeTab(i2)
+            ed.deleteLater()
+        if self.tabs.count() == 0:
+            self._newEditorTab("未命名", None)
+
     def _add(self, tb, text, tip, slot, shortcut=None):
         act = QAction(text, self)
         act.setToolTip(tip)
@@ -934,7 +994,8 @@ class MainWindow(QMainWindow):
                         pass
         with open(target, "w", encoding="utf-8") as f:
             f.write(DEFAULT_TEMPLATE)
-        self.editor.setPlainText(DEFAULT_TEMPLATE)
+        ed = self._newEditorTab(name, target)
+        ed.setPlainText(DEFAULT_TEMPLATE)
         self.currentFile = target
         msg = f"新文件 {name}"
         if removed:
@@ -947,20 +1008,35 @@ class MainWindow(QMainWindow):
             self, "打开文件", self.projectDir,
             "代码文件 (*.cpp *.h *.ino);;所有文件 (*)")
         if p:
+            # 已经开着这个文件？直接切过去，不重复开
+            for i in range(self.tabs.count()):
+                w = self.tabs.widget(i)
+                if getattr(w, "filePath", None) == p:
+                    self.tabs.setCurrentIndex(i)
+                    self.statusLabel.setText(os.path.basename(p))
+                    return
             with open(p, "r", encoding="utf-8", errors="ignore") as f:
-                self.editor.setPlainText(f.read())
+                text = f.read()
+            ed = self._newEditorTab(os.path.basename(p), p)
+            ed.setPlainText(text)
             self.currentFile = p
             self.statusLabel.setText(os.path.basename(p))
 
     def saveFile(self):
-        """保存：写到你当前的这个文件（新建时定的名字）。
+        """保存：写到你当前这个文件（新建时定的名字）。
         还没命名的话，先进“新建”流程给它起名。"""
-        if not self.currentFile:
+        ed = self.editor
+        p = getattr(ed, "filePath", None)
+        if not p:
             self.newFile()
             return
-        with open(self.currentFile, "w", encoding="utf-8") as f:
-            f.write(self.editor.toPlainText())
-        self.statusLabel.setText("已保存 " + os.path.basename(self.currentFile))
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(ed.toPlainText())
+        idx = self.tabs.indexOf(ed)
+        if idx >= 0:
+            self.tabs.setTabText(idx, os.path.basename(p))
+        self.currentFile = p
+        self.statusLabel.setText("已保存 " + os.path.basename(p))
 
     def pickProjectDir(self):
         d = QFileDialog.getExistingDirectory(self, "选择 PlatformIO 项目文件夹", self.projectDir)
@@ -969,14 +1045,23 @@ class MainWindow(QMainWindow):
             self.projectEdit.setText(d)
 
     def loadDemoIfEmpty(self):
-        if not self.editor.toPlainText().strip():
+        ed = self.editor
+        if ed is None or not ed.toPlainText().strip():
             self.loadExampleByName("01_点灯")
 
     def loadExampleByName(self, name):
         code = os.path.join(EXAMPLES_DIR, name, "main.cpp")
         if os.path.isfile(code):
             with open(code, "r", encoding="utf-8", errors="ignore") as f:
-                self.editor.setPlainText(f.read())
+                text = f.read()
+            ed = self.editor
+            # 当前标签是空的“未命名”标签？直接用它，不额外开新页
+            if ed is not None and not ed.toPlainText().strip() \
+                    and not getattr(ed, "filePath", None):
+                self.tabs.setTabText(self.tabs.indexOf(ed), f"示例：{name}")
+            else:
+                ed = self._newEditorTab(f"示例：{name}", None)
+            ed.setPlainText(text)
             # 示例只是“代码素材”：不绑定文件名，保存时会让你重新起名，
             # 免得示例内容把你自己写的程序盖掉。
             self.currentFile = None
@@ -987,27 +1072,32 @@ class MainWindow(QMainWindow):
         if dlg.exec():
             code = dlg.selectedCode()
             if code:
-                self.editor.setPlainText(code)
+                ed = self._newEditorTab("示例（未命名）", None)
+                ed.setPlainText(code)
                 self.currentFile = None
                 self.statusLabel.setText("已载入示例，接线看注释")
 
     # ---------- 补全 ----------
     def onEditorTextChanged(self):
+        # 谁改的代码就处理谁（多标签：不一定是当前显示的页）
+        ed = self.sender()
+        if ed is None or not isinstance(ed, CodeEditor):
+            ed = self.editor
         # 代码一改，旧的报错/漏分号标记就失效，清掉
-        if self.editor.errorLines:
-            self.editor.errorLines = []
-            self.editor.highlightCurrentLine()
-        if self.editor.semiLines:
-            self.editor.semiLines = []
-            self.editor.highlightCurrentLine()
-        tc = self.editor.textCursor()
+        if ed.errorLines:
+            ed.errorLines = []
+            ed.highlightCurrentLine()
+        if ed.semiLines:
+            ed.semiLines = []
+            ed.highlightCurrentLine()
+        tc = ed.textCursor()
         block = tc.block().text()
         rel = tc.position() - tc.block().position()
         if rel == 0:
             return
         last = block[rel - 1]
         if last.isalpha() or last == "_" or last == ".":
-            self.editor.triggerCompletion()
+            ed.triggerCompletion()
 
     # ---------- 轻提示（淡入淡出，不弹窗不打断） ----------
     def toast(self, msg, color="#4ade80", ms=3200):
@@ -1083,15 +1173,17 @@ class MainWindow(QMainWindow):
         # 烧录/编译前：先把编辑器里的代码自动保存到“当前文件”（新建时定的名字）
         # 不然 IDE 编译的是磁盘上的旧代码，你改的没保存就白改了。
         src_dir = os.path.join(self.projectDir, "src")
-        target = self.currentFile
+        ed = self.editor
+        target = getattr(ed, "filePath", None)
         # 如果还没命名 / 文件被挪走 / 打开的是 src 外的文件：兜底用 src\main.cpp
         if (not target or os.path.dirname(target) != src_dir
                 or not os.path.isfile(target)):
             os.makedirs(src_dir, exist_ok=True)
             target = os.path.join(src_dir, "main.cpp")
-            self.currentFile = target
+            ed.filePath = target
         with open(target, "w", encoding="utf-8") as f:
-            f.write(self.editor.toPlainText())
+            f.write(ed.toPlainText())
+        self.currentFile = target
         self.output.append(
             f"<span style='color:#98c379'>✔ 已自动保存编辑器内容 → {target}</span>")
 
