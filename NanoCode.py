@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
     QCompleter, QComboBox, QLabel, QVBoxLayout, QHBoxLayout,
     QWidget, QFileDialog, QMessageBox, QLineEdit, QPushButton, QSplitter,
     QStyledItemDelegate, QListWidget, QListWidgetItem, QDialog, QStyle,
-    QGraphicsOpacityEffect, QInputDialog, QTabWidget
+    QGraphicsOpacityEffect, QInputDialog, QTabWidget, QTabBar, QMenu
 )
 from PySide6.QtGui import (
     QFont, QColor, QTextCharFormat, QSyntaxHighlighter, QPainter,
@@ -658,6 +658,40 @@ class CodeEditor(QPlainTextEdit):
         fixes.sort(key=lambda f: f[0])
         return fixes
 
+    def setMainActions(self, compile_cb, burn_cb):
+        """给编辑器挂上主窗口的「编译」「烧录」动作，右键菜单里用"""
+        self._compileCb = compile_cb
+        self._burnCb = burn_cb
+
+    def contextMenuEvent(self, e):
+        """中文右键菜单：剪切/复制/粘贴 + 编译 + 烧录（不用英文的默认菜单）"""
+        menu = QMenu(self)
+        act_cut = menu.addAction("剪切")
+        act_copy = menu.addAction("复制")
+        act_paste = menu.addAction("粘贴")
+        act_cut.setEnabled(self.textCursor().hasSelection())
+        act_copy.setEnabled(self.textCursor().hasSelection())
+        menu.addSeparator()
+        act_compile = menu.addAction("编译（只检查，不用接板子）")
+        act_burn = menu.addAction("烧录到板子")
+        act = menu.exec(e.globalPos())
+        if act is None:
+            return
+        if act == act_cut:
+            self.cut()
+        elif act == act_copy:
+            self.copy()
+        elif act == act_paste:
+            self.paste()
+        elif act == act_compile:
+            cb = getattr(self, "_compileCb", None)
+            if cb:
+                cb()
+        elif act == act_burn:
+            cb = getattr(self, "_burnCb", None)
+            if cb:
+                cb()
+
 # ==================== 灵动流光进度条 ====================
 class FlowBar(QWidget):
     """编译/烧录时的动画进度条：薄荷绿光带循环流动，完成后变全绿/全红"""
@@ -778,13 +812,15 @@ class MainWindow(QMainWindow):
         self.serial.readyRead.connect(self.onSerialData)
 
         # ---- 编辑器区：多文件标签（像小熊猫/PyCharm 一样来回切） ----
+        # 启动时不开任何标签：啥也没有，点「新建」才建文件
         self.tabs = QTabWidget()
         self.tabs.setTabsClosable(True)
         self.tabs.setDocumentMode(True)
         self.tabs.setMovable(True)
         self.tabs.tabCloseRequested.connect(self.closeTab)
         self.tabs.currentChanged.connect(self.onTabChanged)
-        self._newEditorTab("未命名", None)
+        self.tabs.tabBar().setContextMenuPolicy(Qt.CustomContextMenu)
+        self.tabs.tabBar().customContextMenuRequested.connect(self.onTabMenu)
 
         # ---- 输出面板 ----
         self.output = QTextBrowser()
@@ -882,7 +918,6 @@ class MainWindow(QMainWindow):
         self._add(tb, "串口", "打开/关闭串口监视", self.toggleSerial)
 
         self.refreshPorts()
-        self.loadDemoIfEmpty()
 
     @property
     def editor(self):
@@ -896,6 +931,7 @@ class MainWindow(QMainWindow):
         ed.semiLines = []
         ed.filePath = path
         ed.textChanged.connect(self.onEditorTextChanged)
+        ed.setMainActions(self.build, self.upload)
         font = QFont("Consolas", 13)
         font.setStyleHint(QFont.Monospace)
         ed.setFont(font)
@@ -905,6 +941,68 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(ed, title)
         self.tabs.setCurrentWidget(ed)
         return ed
+
+    def onTabMenu(self, pos):
+        """对标签页标题点右键：重命名 / 编译 / 烧录 / 关闭（全中文）"""
+        tab = self.tabs.tabBar().tabAt(pos)
+        if tab < 0:
+            return
+        self.tabs.setCurrentIndex(tab)
+        menu = QMenu(self)
+        act_rename = menu.addAction("重命名文件…")
+        menu.addSeparator()
+        act_compile = menu.addAction("编译（只检查，不用接板子）")
+        act_burn = menu.addAction("烧录到板子")
+        act_close = menu.addAction("关闭")
+        act = menu.exec(self.tabs.tabBar().mapToGlobal(pos))
+        if act is None:
+            return
+        if act == act_rename:
+            self.renameTab(tab)
+        elif act == act_compile:
+            self.build()
+        elif act == act_burn:
+            self.upload()
+        elif act == act_close:
+            self.closeTab(tab)
+
+    def renameTab(self, idx):
+        """重命名：给文件起新名字（自动 .cpp），磁盘文件、标签、绑定一起改"""
+        ed = self.tabs.widget(idx)
+        if ed is None:
+            return
+        old_path = getattr(ed, "filePath", None)
+        old_name = self.tabs.tabText(idx)
+        default = os.path.basename(old_path) if old_path else old_name
+        default = default.replace("示例：", "")
+        if default.lower().endswith(".cpp"):
+            default = default[:-4]
+        name, ok = QInputDialog.getText(
+            self, "重命名",
+            f"把「{old_name}」改成什么名字？（不用打 .cpp，自动给你加上）",
+            text=default)
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        for ch in '\\/:*?"<>|':
+            name = name.replace(ch, "_")
+        if not name.lower().endswith(".cpp"):
+            name += ".cpp"
+        if old_path and os.path.isfile(old_path):
+            new_path = os.path.join(os.path.dirname(old_path), name)
+            if os.path.abspath(new_path) != os.path.abspath(old_path):
+                if os.path.isfile(new_path):
+                    QMessageBox.warning(self, "重命名", f"{name} 已存在，换个名字吧。")
+                    return
+                try:
+                    os.rename(old_path, new_path)
+                except OSError as err:
+                    QMessageBox.warning(self, "重命名", f"改名失败：{err}")
+                    return
+                ed.filePath = new_path
+        self.tabs.setTabText(idx, name)
+        self.currentFile = getattr(ed, "filePath", None)
+        self.statusLabel.setText("已重命名为 " + name)
 
     def onTabChanged(self, idx):
         ed = self.tabs.widget(idx)
@@ -944,8 +1042,6 @@ class MainWindow(QMainWindow):
         if i2 >= 0:
             self.tabs.removeTab(i2)
             ed.deleteLater()
-        if self.tabs.count() == 0:
-            self._newEditorTab("未命名", None)
 
     def _add(self, tb, text, tip, slot, shortcut=None):
         act = QAction(text, self)
@@ -963,6 +1059,9 @@ class MainWindow(QMainWindow):
         name 参数供测试用（弹窗会挡住自动化）。"""
         if name is None:
             # 默认名 = 当前标签上显示的名字（去掉“示例：”），少打一次字
+            # 先把窗口顶到最前面，免得弹窗被盖住看起来像“没反应”
+            self.raise_()
+            self.activateWindow()
             cur = self.tabs.tabText(self.tabs.currentIndex()) or ""
             default = cur.replace("示例：", "").replace("示例", "")
             for ch in '\\/:*?"<>|':
@@ -1035,6 +1134,9 @@ class MainWindow(QMainWindow):
         还没命名的话，弹窗起名——默认名就是当前标签上显示的名字，
         直接回车就行，不用重新打字。"""
         ed = self.editor
+        if ed is None:
+            self.newFile()
+            return
         p = getattr(ed, "filePath", None)
         if not p:
             # 还没命名：从标签名推导默认名（去掉“示例：”前缀），只起名保存，
@@ -1066,18 +1168,13 @@ class MainWindow(QMainWindow):
         with open(p, "w", encoding="utf-8") as f:
             f.write(ed.toPlainText())
         self.currentFile = p
-        self.statusLabel.setText("已保存 " + os.path.basename(p))
+        self.statusLabel.setText("已保存 " + p)
 
     def pickProjectDir(self):
         d = QFileDialog.getExistingDirectory(self, "选择 PlatformIO 项目文件夹", self.projectDir)
         if d:
             self.projectDir = d
             self.projectEdit.setText(d)
-
-    def loadDemoIfEmpty(self):
-        ed = self.editor
-        if ed is None or not ed.toPlainText().strip():
-            self.loadExampleByName("01_点灯")
 
     def loadExampleByName(self, name):
         code = os.path.join(EXAMPLES_DIR, name, "main.cpp")
@@ -1132,10 +1229,14 @@ class MainWindow(QMainWindow):
     # ---------- 轻提示（淡入淡出，不弹窗不打断） ----------
     def toast(self, msg, color="#4ade80", ms=3200):
         """编辑器底部的小提示：自动淡入淡出，不挡操作、不用点任何按钮"""
+        ed = self.editor
+        if ed is None:      # 一个文件都没有时：退化成状态栏提示，不崩
+            self.statusLabel.setText(msg)
+            return
         if getattr(self, "_toast", None) is not None:
             self._toast.deleteLater()
             self._toast = None
-        t = QLabel(self.editor.viewport())
+        t = QLabel(ed.viewport())
         t.setWordWrap(True)
         t.setMaximumWidth(560)
         t.setAlignment(Qt.AlignCenter)
@@ -1144,7 +1245,7 @@ class MainWindow(QMainWindow):
             f"border-radius:12px;padding:10px 18px;font-size:13px;")
         t.setText(msg)
         t.adjustSize()
-        vp = self.editor.viewport()
+        vp = ed.viewport()
         x = max(8, (vp.width() - t.width()) // 2)
         y = max(8, vp.height() - t.height() - 26)
         t.move(x, y)
@@ -1180,6 +1281,12 @@ class MainWindow(QMainWindow):
         self.runPio(["run", "-t", "upload"], "烧录")
 
     def runPio(self, args, label):
+        ed = self.editor
+        if ed is None:
+            QMessageBox.information(
+                self, label,
+                "现在还没有文件。先点「新建」建一个文件，或点「示例」选个例子。")
+            return
         ini = os.path.join(self.projectDir, "platformio.ini")
         if not os.path.isfile(ini):
             QMessageBox.warning(self, "项目不对",
