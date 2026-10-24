@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
     QCompleter, QComboBox, QLabel, QVBoxLayout, QHBoxLayout,
     QWidget, QFileDialog, QMessageBox, QLineEdit, QPushButton, QSplitter,
     QStyledItemDelegate, QListWidget, QListWidgetItem, QDialog, QStyle,
-    QGraphicsOpacityEffect
+    QGraphicsOpacityEffect, QInputDialog
 )
 from PySide6.QtGui import (
     QFont, QColor, QTextCharFormat, QSyntaxHighlighter, QPainter,
@@ -746,7 +746,7 @@ class ExampleDialog(QDialog):
                 if os.path.isfile(code):
                     with open(code, "r", encoding="utf-8", errors="ignore") as f:
                         text = f.read()
-                    first = text.splitlines()[0].strip(" /=- ") if text.strip() else ""
+                    first = text.splitlines()[0].strip(" /=-") if text.strip() else ""
                     item = QListWidgetItem(f"{d}   ——  {first}")
                     self.items.append((item, code))
                     self.list.addItem(item)
@@ -897,11 +897,50 @@ class MainWindow(QMainWindow):
         return act
 
     # ---------- 文件 ----------
-    def newFile(self):
-        # 写硬件的固定骨架：每次新建自动带 include + setup + loop
+    def newFile(self, name=None):
+        """新建文件：先让用户输入名字（强制 .cpp 结尾），
+        然后真的在 src 下创建这个文件，以后保存/编译都针对它。
+        name 参数供测试用（弹窗会挡住自动化）。"""
+        if name is None:
+            name, ok = QInputDialog.getText(
+                self, "新建文件",
+                "给新文件起个名字（不用打 .cpp，自动给你加上）：",
+                text="main")
+            if not ok or not name.strip():
+                self.statusLabel.setText("已取消新建")
+                return
+        name = name.strip()
+        # 强制 .cpp 结尾：不管用户输什么，最后一定是 xxx.cpp
+        if not name.lower().endswith(".cpp"):
+            name += ".cpp"
+        # 去掉 Windows 不允许的字符，防止路径出错
+        for ch in '\\/:*?"<>|':
+            name = name.replace(ch, "_")
+        src_dir = os.path.join(self.projectDir, "src")
+        os.makedirs(src_dir, exist_ok=True)
+        target = os.path.join(src_dir, name)
+        # 单文件模式：src 里只能有一个 .cpp，否则多个 setup/loop 会编译冲突。
+        # 新建 = 换一个新程序，所以把旧的 .cpp 清掉（会提示你删了谁）。
+        removed = []
+        if os.path.isdir(src_dir):
+            for f in os.listdir(src_dir):
+                p = os.path.join(src_dir, f)
+                if (f.lower().endswith(".cpp") and p != target
+                        and os.path.isfile(p)):
+                    try:
+                        os.remove(p)
+                        removed.append(f)
+                    except OSError:
+                        pass
+        with open(target, "w", encoding="utf-8") as f:
+            f.write(DEFAULT_TEMPLATE)
         self.editor.setPlainText(DEFAULT_TEMPLATE)
-        self.currentFile = None
-        self.statusLabel.setText("新文件（已带 Arduino 基础模板，直接写）")
+        self.currentFile = target
+        msg = f"新文件 {name}"
+        if removed:
+            msg += f"（已移除旧文件 {', '.join(removed)}，保持单文件不冲突）"
+        self.statusLabel.setText(msg)
+        self.toast(msg)
 
     def openFile(self):
         p, _ = QFileDialog.getOpenFileName(
@@ -914,13 +953,11 @@ class MainWindow(QMainWindow):
             self.statusLabel.setText(os.path.basename(p))
 
     def saveFile(self):
+        """保存：写到你当前的这个文件（新建时定的名字）。
+        还没命名的话，先进“新建”流程给它起名。"""
         if not self.currentFile:
-            p, _ = QFileDialog.getSaveFileName(
-                self, "保存文件", os.path.join(self.projectDir, "main.cpp"),
-                "代码文件 (*.cpp);;所有文件 (*)")
-            if not p:
-                return
-            self.currentFile = p
+            self.newFile()
+            return
         with open(self.currentFile, "w", encoding="utf-8") as f:
             f.write(self.editor.toPlainText())
         self.statusLabel.setText("已保存 " + os.path.basename(self.currentFile))
@@ -940,6 +977,9 @@ class MainWindow(QMainWindow):
         if os.path.isfile(code):
             with open(code, "r", encoding="utf-8", errors="ignore") as f:
                 self.editor.setPlainText(f.read())
+            # 示例只是“代码素材”：不绑定文件名，保存时会让你重新起名，
+            # 免得示例内容把你自己写的程序盖掉。
+            self.currentFile = None
             self.statusLabel.setText(f"已载入示例：{name}（接线说明在注释里）")
 
     def showExamples(self):
@@ -948,6 +988,7 @@ class MainWindow(QMainWindow):
             code = dlg.selectedCode()
             if code:
                 self.editor.setPlainText(code)
+                self.currentFile = None
                 self.statusLabel.setText("已载入示例，接线看注释")
 
     # ---------- 补全 ----------
@@ -1039,15 +1080,20 @@ class MainWindow(QMainWindow):
             self.statusLabel.setText(f"已自动补 {len(fixes)} 处分号，继续{label}")
             self.toast(f"帮你补了 {len(fixes)} 处分号 ; 下次记得自己加哦")
 
-        # 烧录/编译前：先把编辑器里的代码自动保存进项目的 src\main.cpp
-        # （不然 IDE 编译的是磁盘上的旧代码，你改的没保存就白改了）
+        # 烧录/编译前：先把编辑器里的代码自动保存到“当前文件”（新建时定的名字）
+        # 不然 IDE 编译的是磁盘上的旧代码，你改的没保存就白改了。
         src_dir = os.path.join(self.projectDir, "src")
-        if os.path.isdir(src_dir):
+        target = self.currentFile
+        # 如果还没命名 / 文件被挪走 / 打开的是 src 外的文件：兜底用 src\main.cpp
+        if (not target or os.path.dirname(target) != src_dir
+                or not os.path.isfile(target)):
+            os.makedirs(src_dir, exist_ok=True)
             target = os.path.join(src_dir, "main.cpp")
-            with open(target, "w", encoding="utf-8") as f:
-                f.write(self.editor.toPlainText())
-            self.output.append(
-                f"<span style='color:#98c379'>✔ 已自动保存编辑器内容 → {target}</span>")
+            self.currentFile = target
+        with open(target, "w", encoding="utf-8") as f:
+            f.write(self.editor.toPlainText())
+        self.output.append(
+            f"<span style='color:#98c379'>✔ 已自动保存编辑器内容 → {target}</span>")
 
         env = os.environ.copy()
         env["PLATFORMIO_CORE_DIR"] = PLATFORMIO_CORE_DIR
