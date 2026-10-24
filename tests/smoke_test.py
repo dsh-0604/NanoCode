@@ -29,6 +29,7 @@ app.setStyle("Fusion")
 # 1. 主窗口能启动
 win = C.MainWindow()
 check("主窗口能启动，标题含 NanoCode", "NanoCode" in win.windowTitle())
+check("启动时没有任何空标签（点新建才建文件）", win.tabs.count() == 0)
 
 # 2. 新建文件自带 Arduino 模板（传名字绕过弹窗）
 win.newFile("smoke")
@@ -100,5 +101,5 @@ check("切回第一个标签，内容仍是原文件", win.editor.toPlainText().
 win.tabs.setCurrentIndex(1)
 check("切到第二个标签，内容是新文件模板", win.editor.toPlainText().startswith("#include <Arduino.h>"))
 
-print("\n结果：%d 项通过，%d 项失败" % (20 - len(FAILS), len(FAILS)))
+print("\n结果：%d 项通过，%d 项失败" % (21 - len(FAILS), len(FAILS)))
 sys.exit(1 if FAILS else 0)
