@@ -30,12 +30,13 @@ app.setStyle("Fusion")
 win = C.MainWindow()
 check("主窗口能启动，标题含 NanoCode", "NanoCode" in win.windowTitle())
 
-# 2. 新建文件自带 Arduino 模板
-win.newFile()
+# 2. 新建文件自带 Arduino 模板（传名字绕过弹窗）
+win.newFile("smoke")
 text = win.editor.toPlainText()
 check("新建文件带 #include <Arduino.h>", "#include <Arduino.h>" in text)
 check("新建文件带 void setup()", "void setup()" in text)
 check("新建文件带 void loop()", "void loop()" in text)
+check("新建文件已绑定为 src 下的 .cpp", win.currentFile is not None and win.currentFile.lower().endswith(".cpp"))
 
 # 3. 示例能载入
 win.loadExampleByName("01_点灯")
@@ -87,5 +88,17 @@ m2 = ed2._completionModel
 names2 = [m2.data(m2.index(i, 0), Qt.DisplayRole) for i in range(m2.rowCount())]
 check("输入 Serial. 弹出成员函数", "Serial.begin" in names2 and "Serial.println" in names2)
 
-print("\n结果：%d 项通过，%d 项失败" % (16 - len(FAILS), len(FAILS)))
+# 7. 多文件标签：开第二个文件，新开标签页并切换，内容不串
+before = win.tabs.count()
+win.newFile("second")
+check("多标签：再建一个文件后多开 1 个标签", win.tabs.count() == before + 1)
+check("当前标签是第二个文件", win.currentFile is not None and win.currentFile.endswith("second.cpp"))
+# 切回第一个标签，编辑器内容还是第一个文件
+win.tabs.setCurrentIndex(0)
+check("切回第一个标签，内容仍是原文件", win.editor.toPlainText().startswith("#include <Arduino.h>"))
+# 再切到第二个标签
+win.tabs.setCurrentIndex(1)
+check("切到第二个标签，内容是新文件模板", win.editor.toPlainText().startswith("#include <Arduino.h>"))
+
+print("\n结果：%d 项通过，%d 项失败" % (20 - len(FAILS), len(FAILS)))
 sys.exit(1 if FAILS else 0)
