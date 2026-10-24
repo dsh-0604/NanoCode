@@ -962,10 +962,18 @@ class MainWindow(QMainWindow):
         然后真的在 src 下创建这个文件，以后保存/编译都针对它。
         name 参数供测试用（弹窗会挡住自动化）。"""
         if name is None:
+            # 默认名 = 当前标签上显示的名字（去掉“示例：”），少打一次字
+            cur = self.tabs.tabText(self.tabs.currentIndex()) or ""
+            default = cur.replace("示例：", "").replace("示例", "")
+            for ch in '\\/:*?"<>|':
+                default = default.replace(ch, "_")
+            default = default.strip()
+            if not default or default == "未命名":
+                default = "main"
             name, ok = QInputDialog.getText(
                 self, "新建文件",
                 "给新文件起个名字（不用打 .cpp，自动给你加上）：",
-                text="main")
+                text=default)
             if not ok or not name.strip():
                 self.statusLabel.setText("已取消新建")
                 return
@@ -1024,17 +1032,39 @@ class MainWindow(QMainWindow):
 
     def saveFile(self):
         """保存：写到你当前这个文件（新建时定的名字）。
-        还没命名的话，先进“新建”流程给它起名。"""
+        还没命名的话，弹窗起名——默认名就是当前标签上显示的名字，
+        直接回车就行，不用重新打字。"""
         ed = self.editor
         p = getattr(ed, "filePath", None)
         if not p:
-            self.newFile()
-            return
+            # 还没命名：从标签名推导默认名（去掉“示例：”前缀），只起名保存，
+            # 不删任何文件（删旧文件只有主动点“新建”才做）。
+            cur = self.tabs.tabText(self.tabs.indexOf(ed)) or ""
+            default = cur.replace("示例：", "").replace("示例", "")
+            for ch in '\\/:*?"<>|':
+                default = default.replace(ch, "_")
+            default = default.strip()
+            if not default or default == "未命名":
+                default = "main"
+            name, ok = QInputDialog.getText(
+                self, "保存文件",
+                "给文件起个名字（不用打 .cpp，自动给你加上）：",
+                text=default)
+            if not ok or not name.strip():
+                self.statusLabel.setText("已取消保存")
+                return
+            name = name.strip()
+            if not name.lower().endswith(".cpp"):
+                name += ".cpp"
+            for ch in '\\/:*?"<>|':
+                name = name.replace(ch, "_")
+            src_dir = os.path.join(self.projectDir, "src")
+            os.makedirs(src_dir, exist_ok=True)
+            p = os.path.join(src_dir, name)
+            ed.filePath = p
+            self.tabs.setTabText(self.tabs.indexOf(ed), name)
         with open(p, "w", encoding="utf-8") as f:
             f.write(ed.toPlainText())
-        idx = self.tabs.indexOf(ed)
-        if idx >= 0:
-            self.tabs.setTabText(idx, os.path.basename(p))
         self.currentFile = p
         self.statusLabel.setText("已保存 " + os.path.basename(p))
 
