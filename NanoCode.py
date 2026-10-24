@@ -1037,7 +1037,8 @@ class MainWindow(QMainWindow):
             if r == QMessageBox.Cancel:
                 return
             if r == QMessageBox.Save:
-                self.saveFile()
+                # 关键：保存的是【被关闭的这个文件】，不是当前选中的那个！
+                self.saveEditor(ed)
         i2 = self.tabs.indexOf(ed)
         if i2 >= 0:
             self.tabs.removeTab(i2)
@@ -1099,6 +1100,14 @@ class MainWindow(QMainWindow):
                         removed.append(f)
                     except OSError:
                         pass
+                    # 这个旧文件如果还开在某个标签里：让标签变成“未命名”，
+                    # 免得标签还指着已经不存在的文件
+                    for i in range(self.tabs.count()):
+                        w = self.tabs.widget(i)
+                        if w is not None and getattr(w, "filePath", None) == p:
+                            w.filePath = None
+                            self.tabs.setTabText(
+                                i, self.tabs.tabText(i) + "（文件已删，另存为新名）")
         with open(target, "w", encoding="utf-8") as f:
             f.write(DEFAULT_TEMPLATE)
         ed = self._newEditorTab(name, target)
@@ -1133,9 +1142,15 @@ class MainWindow(QMainWindow):
         """保存：写到你当前这个文件（新建时定的名字）。
         还没命名的话，弹窗起名——默认名就是当前标签上显示的名字，
         直接回车就行，不用重新打字。"""
-        ed = self.editor
-        if ed is None:
+        if self.editor is None:
             self.newFile()
+            return
+        self.saveEditor(self.editor)
+
+    def saveEditor(self, ed):
+        """把【指定编辑器】的内容存到它自己的文件。
+        传 ed 而不是只存当前页——关标签时存被关的那个，才不会存错文件。"""
+        if ed is None:
             return
         p = getattr(ed, "filePath", None)
         if not p:
@@ -1167,7 +1182,8 @@ class MainWindow(QMainWindow):
             self.tabs.setTabText(self.tabs.indexOf(ed), name)
         with open(p, "w", encoding="utf-8") as f:
             f.write(ed.toPlainText())
-        self.currentFile = p
+        if self.tabs.currentWidget() is ed:
+            self.currentFile = p
         self.statusLabel.setText("已保存 " + p)
 
     def pickProjectDir(self):
@@ -1318,6 +1334,8 @@ class MainWindow(QMainWindow):
             os.makedirs(src_dir, exist_ok=True)
             target = os.path.join(src_dir, "main.cpp")
             ed.filePath = target
+            # 标签也跟着改成 main.cpp，免得标签名和磁盘文件名对不上
+            self.tabs.setTabText(self.tabs.indexOf(ed), "main.cpp")
         with open(target, "w", encoding="utf-8") as f:
             f.write(ed.toPlainText())
         self.currentFile = target
