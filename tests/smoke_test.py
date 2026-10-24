@@ -101,5 +101,19 @@ check("切回第一个标签，内容仍是原文件", win.editor.toPlainText().
 win.tabs.setCurrentIndex(1)
 check("切到第二个标签，内容是新文件模板", win.editor.toPlainText().startswith("#include <Arduino.h>"))
 
-print("\n结果：%d 项通过，%d 项失败" % (21 - len(FAILS), len(FAILS)))
+# 8. 保存指定编辑器（关标签时存被关的那个，而不是当前页）
+# tabs 顺序：0=smoke（已被新建 second 时从磁盘删掉）、1=示例、2=second
+w2 = win.tabs.widget(2)   # second.cpp（有真实文件）
+w2.setPlainText("// 这是第二个文件的独特内容\n" + w2.toPlainText())
+win.tabs.setCurrentIndex(0)   # 当前页是 smoke
+win.saveEditor(w2)            # 但保存的是 second.cpp 自己
+with open(w2.filePath, "r", encoding="utf-8") as f:
+    disk = f.read()
+check("保存指定编辑器：写的是被保存文件自己的路径", disk.startswith("// 这是第二个文件的独特内容"))
+check("保存指定编辑器：没有误改当前页文件", win.editor.toPlainText().startswith("#include <Arduino.h>"))
+# 保存后当前页没变，第二个文件内容仍在内存里
+win.tabs.setCurrentIndex(2)
+check("保存指定编辑器：被保存文件内容保留", win.editor.toPlainText().startswith("// 这是第二个文件的独特内容"))
+
+print("\n结果：%d 项通过，%d 项失败" % (24 - len(FAILS), len(FAILS)))
 sys.exit(1 if FAILS else 0)
