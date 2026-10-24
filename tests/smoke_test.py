@@ -1,0 +1,91 @@
+# -*- coding: utf-8 -*-
+"""NanoCode 冒烟测试（无界面运行，一分钟内跑完）
+用法：python tests/smoke_test.py
+检查：能启动主窗口、新建文件有基础模板、示例能载入、补全去重、模板补全数据正确。
+"""
+import os
+import sys
+
+os.environ["QT_QPA_PLATFORM"] = "offscreen"
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import NanoCode as C
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QTextCursor
+from PySide6.QtWidgets import QApplication
+
+FAILS = []
+
+
+def check(name, cond):
+    print(("PASS  " if cond else "FAIL  ") + name)
+    if not cond:
+        FAILS.append(name)
+
+
+app = QApplication(sys.argv)
+app.setStyle("Fusion")
+
+# 1. 主窗口能启动
+win = C.MainWindow()
+check("主窗口能启动，标题含 NanoCode", "NanoCode" in win.windowTitle())
+
+# 2. 新建文件自带 Arduino 模板
+win.newFile()
+text = win.editor.toPlainText()
+check("新建文件带 #include <Arduino.h>", "#include <Arduino.h>" in text)
+check("新建文件带 void setup()", "void setup()" in text)
+check("新建文件带 void loop()", "void loop()" in text)
+
+# 3. 示例能载入
+win.loadExampleByName("01_点灯")
+t1 = win.editor.toPlainText()
+check("示例 01_点灯 载入（含 pinMode）", "pinMode" in t1 and "digitalWrite" in t1)
+
+# 4. 补全去重 + 类型
+res = C.build_completion_list("pin")
+names = [n for n, d, s, k in res]
+check("补全 pin 时 pinMode 只出现 1 次", names.count("pinMode") == 1)
+kinds = dict((n, k) for n, d, s, k in res)
+check("pinMode 类型为片段(模板)", kinds.get("pinMode") == C.KIND_SNIPPET)
+
+# 5. 模板数据正确（$1 占位 + 括号分号）
+sn = __import__("keywords").SNIPPETS["pinMode"]
+check("pinMode 模板带括号和分号", sn == "pinMode($1, $2);")
+
+# 5.1 固定句式模板扩充：结构语句 + 成员函数
+sns = __import__("keywords").SNIPPETS
+check("while/else/switch 都有固定句式模板",
+      all(k in sns for k in ("while", "else", "switch", "include")))
+check("Serial.begin 有模板", "Serial.begin($1);" in sns.get("Serial.begin", ""))
+check("include 模板补全成 #include <...>", sns.get("include") == "#include <$1>")
+check("setup/loop 模板补全成 void setup()/void loop()",
+      sns.get("setup") == "void setup() {\n    $1\n}" and
+      sns.get("loop") == "void loop() {\n    $1\n}")
+
+# 6. 补全弹窗数据（QStandardItemModel 自定义角色）
+ed = C.CodeEditor()
+ed.setPlainText("pin")
+cur = ed.textCursor()
+cur.movePosition(QTextCursor.MoveOperation.End)
+ed.setTextCursor(cur)
+ed.triggerCompletion()
+m = ed._completionModel
+row0 = m.index(0, 0)
+check("补全列表弹出且第一项是 pinMode", m.data(row0, Qt.DisplayRole) == "pinMode")
+check("补全项带中文说明", bool(m.data(row0, Qt.UserRole)))
+check("补全项带类型标签", m.data(row0, Qt.UserRole + 2) == C.KIND_SNIPPET)
+
+# 6.1 带点补全：Serial. → Serial.begin/print/println
+ed2 = C.CodeEditor()
+ed2.setPlainText("Serial.")
+cur2 = ed2.textCursor()
+cur2.movePosition(QTextCursor.MoveOperation.End)
+ed2.setTextCursor(cur2)
+ed2.triggerCompletion()
+m2 = ed2._completionModel
+names2 = [m2.data(m2.index(i, 0), Qt.DisplayRole) for i in range(m2.rowCount())]
+check("输入 Serial. 弹出成员函数", "Serial.begin" in names2 and "Serial.println" in names2)
+
+print("\n结果：%d 项通过，%d 项失败" % (16 - len(FAILS), len(FAILS)))
+sys.exit(1 if FAILS else 0)
