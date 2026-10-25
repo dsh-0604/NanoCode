@@ -61,7 +61,7 @@ DEFAULT_TEMPLATE = (
 
 # ==================== 自动扫描头文件补充词库 ====================
 EXTRA_FUNCTIONS = set()
-_FUNC_RE = re.compile(r"\b([a-zA-Z_]\w*)\s*\(")
+_FUNC_RE = re.compile(r"\b([a-zA-Z_]\w*)\s*\\(")
 
 def scan_arduino_headers():
     dirs = [FRAMEWORK_CORES]
@@ -191,7 +191,7 @@ class CppHighlighter(QSyntaxHighlighter):
             r"\b(" + "|".join(k for k, _ in KW.CORE_KEYWORDS) + r")\b"), kw))
         func = QTextCharFormat()
         func.setForeground(QColor("#61afef"))
-        self.rules.append((re.compile(r"\b[A-Za-z_]\w*(?=\s*\("), func))
+        self.rules.append((re.compile(r"\b[A-Za-z_]\w*(?=\s*\\("), func))
         num = QTextCharFormat()
         num.setForeground(QColor("#d19a66"))
         self.rules.append((re.compile(r"\b\d+\.?\d*[fF]?\b"), num))
@@ -782,7 +782,7 @@ class ExampleDialog(QDialog):
                         text = f.read()
                     first = text.splitlines()[0].strip(" /=-") if text.strip() else ""
                     item = QListWidgetItem(f"{d}   ——  {first}")
-                    self.items.append((item, code))
+                    self.items.append((item, code, d))
                     self.list.addItem(item)
         lay.addWidget(self.list)
         self.list.itemDoubleClicked.connect(self.accept)
@@ -792,11 +792,12 @@ class ExampleDialog(QDialog):
         animate_window_open(self)
 
     def selectedCode(self):
+        """返回 (示例名, 代码)：示例名直接当保存时的默认文件名"""
         row = self.list.currentRow()
         if 0 <= row < len(self.items):
             with open(self.items[row][1], "r", encoding="utf-8", errors="ignore") as f:
-                return f.read()
-        return ""
+                return self.items[row][2], f.read()
+        return "", ""
 
 # ==================== 主窗口 ====================
 class MainWindow(QMainWindow):
@@ -1147,29 +1148,37 @@ class MainWindow(QMainWindow):
             return
         self.saveEditor(self.editor)
 
+    def _defaultNameFromLabel(self, ed):
+        """从标签名推导“默认文件名”：去掉“示例：”前缀和“（未命名）”残留，
+        再不行就回退 main。保证存出来的文件名不奇怪。"""
+        cur = self.tabs.tabText(self.tabs.indexOf(ed)) or ""
+        default = cur.replace("示例：", "").replace("示例", "")
+        default = default.replace("（未命名）", "").replace("未命名", "")
+        for ch in '\\/:*?"<>|':
+            default = default.replace(ch, "_")
+        default = default.strip()
+        if not default:
+            default = "main"
+        return default
+
     def saveEditor(self, ed):
         """把【指定编辑器】的内容存到它自己的文件。
-        传 ed 而不是只存当前页——关标签时存被关的那个，才不会存错文件。"""
+        传 ed 而不是只存当前页——关标签时存被关的那个，才不会存错文件。
+        返回 True=保存成功，False=用户取消了命名（没存上）。"""
         if ed is None:
-            return
+            return False
         p = getattr(ed, "filePath", None)
         if not p:
-            # 还没命名：从标签名推导默认名（去掉“示例：”前缀），只起名保存，
+            # 还没命名：从标签名推导默认名，只起名保存，
             # 不删任何文件（删旧文件只有主动点“新建”才做）。
-            cur = self.tabs.tabText(self.tabs.indexOf(ed)) or ""
-            default = cur.replace("示例：", "").replace("示例", "")
-            for ch in '\\/:*?"<>|':
-                default = default.replace(ch, "_")
-            default = default.strip()
-            if not default or default == "未命名":
-                default = "main"
+            default = self._defaultNameFromLabel(ed)
             name, ok = QInputDialog.getText(
                 self, "保存文件",
                 "给文件起个名字（不用打 .cpp，自动给你加上）：",
                 text=default)
             if not ok or not name.strip():
                 self.statusLabel.setText("已取消保存")
-                return
+                return False
             name = name.strip()
             if not name.lower().endswith(".cpp"):
                 name += ".cpp"
@@ -1185,6 +1194,7 @@ class MainWindow(QMainWindow):
         if self.tabs.currentWidget() is ed:
             self.currentFile = p
         self.statusLabel.setText("已保存 " + p)
+        return True
 
     def pickProjectDir(self):
         d = QFileDialog.getExistingDirectory(self, "选择 PlatformIO 项目文件夹", self.projectDir)
@@ -1213,12 +1223,11 @@ class MainWindow(QMainWindow):
     def showExamples(self):
         dlg = ExampleDialog(self)
         if dlg.exec():
-            code = dlg.selectedCode()
+            name, code = dlg.selectedCode()
             if code:
-                ed = self._newEditorTab("示例（未命名）", None)
-                ed.setPlainText(code)
-                self.currentFile = None
-                self.statusLabel.setText("已载入示例，接线看注释")
+                # 和 loadExampleByName 走同一套逻辑：当前是空标签就复用，
+                # 标签名显示“示例：xxx”，保存时默认文件名就是 xxx
+                self.loadExampleByName(name)
 
     # ---------- 补全 ----------
     def onEditorTextChanged(self):
@@ -1394,6 +1403,10 @@ class MainWindow(QMainWindow):
             self.output.append(f"<span style='color:#98c379'>✔ {label}完成！</span>")
             self.statusLabel.setText(f"{label}完成 ✔")
             self.progressLabel.setText(f"✔ {label}完成")
+            if label == "烧录":
+                # 烧录完可能重新枚举出 COM 口，刷新一下，顺便提示下一步
+                self.refreshPorts()
+                self.statusLabel.setText("烧录完成 ✔ 想看板子输出？点上方「打开串口」")
         else:
             self.output.append(f"<span style='color:#e06c75'>✘ {label}出错（代码 {code}）</span>")
             if self.errorLines:
@@ -1473,6 +1486,39 @@ class MainWindow(QMainWindow):
         sb.setValue(sb.maximum())
 
     def closeEvent(self, e):
+        # 检查所有标签：有改动没保存的先问一下，别让新手白写半天
+        dirty = []
+        for i in range(self.tabs.count()):
+            w = self.tabs.widget(i)
+            if w is None:
+                continue
+            p = getattr(w, "filePath", None)
+            if p and os.path.isfile(p):
+                with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                    if f.read() != w.toPlainText():
+                        dirty.append((w, self.tabs.tabText(i)))
+            elif w.toPlainText().strip():
+                dirty.append((w, self.tabs.tabText(i)))
+        if dirty:
+            names = "、".join(n for _, n in dirty[:3])
+            if len(dirty) > 3:
+                names += f" 等 {len(dirty)} 个文件"
+            r = QMessageBox.question(
+                self, "有内容没保存",
+                f"「{names}」有改动没保存，直接退出会丢掉哦。\n"
+                "要现在保存吗？（选否=不保存直接退出）",
+                QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+                QMessageBox.Save)
+            if r == QMessageBox.Cancel:
+                e.ignore()
+                return
+            if r == QMessageBox.Save:
+                # 逐个保存；中途取消命名的话就不关窗口，免得丢内容
+                for w, _ in dirty:
+                    if not self.saveEditor(w):
+                        self.statusLabel.setText("有文件没保存，退出已取消")
+                        e.ignore()
+                        return
         if self.serial.isOpen():
             self.serial.close()
         if self.process and self.process.state() != QProcess.NotRunning:
