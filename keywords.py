@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+"# -*- coding: utf-8 -*-
 """内置词库：C++ 关键字 + Arduino/ESP32 常用函数，每个带中文说明。
 格式：名称, 中文提示（会显示在补全列表里）
 """
@@ -150,7 +150,7 @@ ARDUINO_KEYWORDS = [
     ("BLEDevice::init", "BLEDevice::init(名字) 初始化 BLE"),
     ("BLEDevice::createServer", "BLEDevice::createServer() 创建 BLE 服务端"),
     ("BLEDevice::getAdvertising", "BLEDevice::getAdvertising() 获取广播对象"),
-    ("BLEAdvertizer", "蓝牙广播对象，用来对外广播名字"),
+    ("BLEAdvertiser", "蓝牙广播对象，用来对外广播名字"),
     ("BLECharacteristic", "BLE 特征：可读可写的“数据通道”"),
     ("BLEUUID", "BLE 通用唯一标识符（UUID）"),
     ("BluetoothSerial", "经典蓝牙串口：BluetoothSerial BT;"),
