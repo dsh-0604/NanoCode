@@ -31,18 +31,37 @@ from PySide6.QtSerialPort import QSerialPort, QSerialPortInfo
 
 import keywords as KW
 
-# PlatformIO 报错格式：src\main.cpp:7:5: error: xxx
+# PlatformIO 报错格式：src\main.cpp:7:5: error: xxx（也可能是 D:\...\main.cpp 绝对路径）
 ERR_RE = re.compile(
-    r"([^:\s]+\.(?:cpp|ino|h))\s*:\s*(\d+)\s*(?::\s*(\d+))?\s*:\s*(error|warning|fatal error):\s*(.*)",
+    r"((?:[A-Za-z]:[\\/])?[^:\s]+\.(?:cpp|ino|h))\s*:\s*(\d+)\s*(?::\s*(\d+))?\s*:\s*(error|warning|fatal error):\s*(.*)",
     re.I)
 
-# ==================== 路径配置（可在下边改） ====================
+# ==================== 路径配置（可在下边改，默认 D 盘） ====================
 PIO_EXE = r"D:\platformio-core\penv\Scripts\pio.exe"
 PLATFORMIO_CORE_DIR = r"D:\platformio-core"
 DEFAULT_PROJECT = r"D:\PlatformIO\c3_blink"
 FRAMEWORK_CORES = r"D:\platformio-core\packages\framework-arduinoespressif32\cores\esp32"
 FRAMEWORK_LIBS = r"D:\platformio-core\packages\framework-arduinoespressif32\libraries"
 EXAMPLES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "examples")
+
+def detect_paths():
+    """换电脑也能用：默认路径不存在时，自动去 PATH 里找 pio.exe / git。
+    找不到就保持原路径，编译时再给友好提示。"""
+    global PIO_EXE, PLATFORMIO_CORE_DIR, FRAMEWORK_CORES, FRAMEWORK_LIBS
+    if os.path.isfile(PIO_EXE):
+        return
+    for d in os.environ.get("PATH", "").split(";"):
+        cand = os.path.join(d, "pio.exe")
+        if os.path.isfile(cand):
+            PIO_EXE = cand
+            PLATFORMIO_CORE_DIR = os.path.dirname(os.path.dirname(d))
+            FRAMEWORK_CORES = os.path.join(
+                PLATFORMIO_CORE_DIR, "packages",
+                "framework-arduinoespressif32", "cores", "esp32")
+            FRAMEWORK_LIBS = os.path.join(
+                PLATFORMIO_CORE_DIR, "packages",
+                "framework-arduinoespressif32", "libraries")
+            break
 
 # 新建文件默认模板：写硬件的固定骨架，每次新建自动带上
 DEFAULT_TEMPLATE = (
@@ -61,7 +80,7 @@ DEFAULT_TEMPLATE = (
 
 # ==================== 自动扫描头文件补充词库 ====================
 EXTRA_FUNCTIONS = set()
-_FUNC_RE = re.compile(r"\b([a-zA-Z_]\w*)\s*\\(")
+_FUNC_RE = re.compile(r"\b([a-zA-Z_]\w*)\s*\(")
 
 def scan_arduino_headers():
     dirs = [FRAMEWORK_CORES]
@@ -98,7 +117,9 @@ HOT = {
 }
 
 def fuzzy_score(pattern, word):
-    """模糊打分：前缀 > 中间包含 > 逐字符顺序（如 pM → pinMode）。越高越像"""
+    """模糊打分：前缀 > 中间包含 > 逐字符顺序（如 pM → pinMode）。越高越像。
+    首字母缩写（pattern 首字 = 单词首字）单独加分，拉开和“随机包含”的差距，
+    避免 pM 匹配出一堆 EEPROM 之类的噪声。"""
     p = pattern.lower()
     w = word.lower()
     if not p:
@@ -108,7 +129,7 @@ def fuzzy_score(pattern, word):
     else:
         idx = w.find(p)
         if idx >= 0:
-            s = 80 - idx * 0.4 - len(w) * 0.05
+            s = 60 - idx * 0.4 - len(w) * 0.05
         else:
             last = -1
             cnt = 0
@@ -119,7 +140,10 @@ def fuzzy_score(pattern, word):
                 last = j
                 cnt += 1
             if cnt == len(p):
-                s = 50 - len(w) * 0.05 - last * 0.05
+                s = 35 - len(w) * 0.05 - last * 0.08
+                # 首字母缩写加分：pM → pinMode（首字对上了才算真缩写）
+                if w.startswith(p[0]):
+                    s += 18
             else:
                 return -1
     if word in HOT:
@@ -191,7 +215,7 @@ class CppHighlighter(QSyntaxHighlighter):
             r"\b(" + "|".join(k for k, _ in KW.CORE_KEYWORDS) + r")\b"), kw))
         func = QTextCharFormat()
         func.setForeground(QColor("#61afef"))
-        self.rules.append((re.compile(r"\b[A-Za-z_]\w*(?=\s*\\("), func))
+        self.rules.append((re.compile(r"\b[A-Za-z_]\w*(?=\s*\()"), func))
         num = QTextCharFormat()
         num.setForeground(QColor("#d19a66"))
         self.rules.append((re.compile(r"\b\d+\.?\d*[fF]?\b"), num))
@@ -352,6 +376,10 @@ class CodeEditor(QPlainTextEdit):
         self.setLineWrapMode(QPlainTextEdit.NoWrap)
         self.completer = None
         self.initCompleter()
+        # 片段占位跳转：打字离开占位符后，标记自动失效
+        self._snippetMarks = None
+        self._snippetIdx = 0
+        self.document().contentsChanged.connect(self._clearSnippetMarksIfMoved)
 
     def initCompleter(self):
         model = QStandardItemModel(self)
@@ -374,7 +402,10 @@ class CodeEditor(QPlainTextEdit):
         self.textCursor().insertText(extra)
 
     def _insertSnippet(self, snippet):
-        """插入代码模板：删掉刚输入的前缀，填完整句式，光标停在第 1 个占位处"""
+        """插入代码模板：删掉刚输入的前缀，填完整句式，光标停在第 1 个占位处。
+        关键：$1 的位置要在“删掉所有占位符之后”的正文里重新算，
+        否则有换行缩进或多个占位符时光标会停错。
+        记录所有 $N 占位位置，之后按 Tab 可以在占位符之间跳（switch 那种多占位）。"""
         tc = self.textCursor()
         prefix = self.completer.completionPrefix()
         block = tc.block()
@@ -385,15 +416,56 @@ class CodeEditor(QPlainTextEdit):
             tc.setPosition(block.position() + start)
             tc.setPosition(block.position() + rel, QTextCursor.KeepAnchor)
             tc.removeSelectedText()
-        # 找第一个占位符 $1：替换为空，其余占位 $2… 也清掉（本版不做占位跳转）
-        first = snippet.find("$1")
+        first_raw = snippet.find("$1")
         body = re.sub(r"\$[0-9]+", "", snippet)
+        pos = 0
+        if first_raw >= 0:
+            # $1 之前每有一个占位符（$N 占 2 个字符），body 里就少 2 个字符
+            before_raw = snippet[:first_raw]
+            n_placeholders = len(re.findall(r"\$[0-9]+", before_raw))
+            pos = len(before_raw) - n_placeholders * 2
         tc.insertText(body)
-        if first >= 0:
-            pos = tc.position() - len(body) + first
+        if first_raw >= 0:
             cur = QTextCursor(self.document())
-            cur.setPosition(pos)
+            cur.setPosition(tc.position() - len(body) + pos)
             self.setTextCursor(cur)
+        # 记录所有占位位置（body 中的偏移），供 Tab 跳转
+        marks = []
+        offset = 0
+        for m in re.finditer(r"\$[0-9]+", snippet):
+            marks.append(m.start() - offset)
+            offset += 2
+        self._snippetMarks = marks
+        self._snippetIdx = 0
+
+    def _jumpSnippetMark(self, delta):
+        """在代码片段的占位符之间跳（Tab 下一个，Shift+Tab 上一个）"""
+        marks = getattr(self, "_snippetMarks", None)
+        if not marks:
+            return
+        n = len(marks)
+        self._snippetIdx = (self._snippetIdx + delta) % n
+        cur = QTextCursor(self.document())
+        cur.setPosition(marks[self._snippetIdx])
+        self.setTextCursor(cur)
+
+    def _clearSnippetMarksIfMoved(self):
+        """用户真的打字了（光标离开占位符）→ 占位跳转标记作废"""
+        marks = getattr(self, "_snippetMarks", None)
+        if not marks:
+            return
+        pos = self.textCursor().position()
+        if pos not in marks:
+            self._snippetMarks = None
+
+    def _zoomFont(self, delta):
+        """Ctrl+= / Ctrl+- 调字号（8~30 之间）"""
+        f = self.font()
+        size = f.pointSize() + delta
+        if 8 <= size <= 30:
+            f.setPointSize(size)
+            self.setFont(f)
+            self.setTabStopDistance(4 * self.fontMetrics().horizontalAdvance(" "))
 
     def currentWord(self):
         """光标前的补全前缀：支持单词（pin），也支持 Serial. 这种带点的"""
@@ -422,13 +494,27 @@ class CodeEditor(QPlainTextEdit):
         if e.key() == Qt.Key_Space and (e.modifiers() & Qt.ControlModifier):
             self.triggerCompletion()
             return
+        if e.key() in (Qt.Key_Equal, Qt.Key_Plus) and (e.modifiers() & Qt.ControlModifier):
+            self._zoomFont(1)
+            return
+        if e.key() == Qt.Key_Minus and (e.modifiers() & Qt.ControlModifier):
+            self._zoomFont(-1)
+            return
         if e.key() == Qt.Key_Tab:
+            marks = getattr(self, "_snippetMarks", None)
+            if marks and not self.textCursor().hasSelection():
+                self._jumpSnippetMark(1)
+                return
             if self.textCursor().hasSelection():
                 self.indentBlock(1)
                 return
             super().keyPressEvent(e)
             return
         if e.key() == Qt.Key_Backtab:
+            marks = getattr(self, "_snippetMarks", None)
+            if marks and not self.textCursor().hasSelection():
+                self._jumpSnippetMark(-1)
+                return
             if self.textCursor().hasSelection():
                 self.indentBlock(-1)
                 return
@@ -486,8 +572,8 @@ class CodeEditor(QPlainTextEdit):
         unit = "\t" if "\t" in indent else "    "
         if before.endswith("{"):
             indent += unit
-        elif before.endswith(":") or re.match(r"^(else|do)$", before):
-            # case 1: / default: / else / do 单独一行 → 进一级
+        elif before.endswith(":") or re.search(r"(?:else|do)\b\s*$", before):
+            # case 1: / default: / else / do 单独一行（或 "} else" 同行）→ 进一级
             if not before.endswith(";"):
                 indent += unit
         elif stripped.startswith("}"):
@@ -624,6 +710,13 @@ class CodeEditor(QPlainTextEdit):
                 if nxt.startswith("{"):
                     continue  # 函数头 / if 括号后跟 {，不需要分号
                 bad.append(i + 1)
+                continue
+            if code[-1] == "}":
+                # 一行多语句：void loop(){ digitalWrite(8, HIGH) }
+                # } 之前最近是 ")" 且是函数调用（不是 setup() { 这种头）→ 漏分号
+                before_brace = code[:-1].rstrip()
+                if re.search(r"[A-Za-z_]\w*\s*\([^()]*\)\s*$", before_brace):
+                    bad.append(i + 1)
                 continue
             if code[-1].isalnum() or code[-1] == "]":
                 bad.append(i + 1)
@@ -772,6 +865,10 @@ class ExampleDialog(QDialog):
         tip = QLabel("点一个示例，代码会直接进编辑器（接线说明在代码注释里）")
         tip.setWordWrap(True)
         lay.addWidget(tip)
+        self.searchEdit = QLineEdit()
+        self.searchEdit.setPlaceholderText("搜示例：比如「灯」「串口」「PWM」")
+        self.searchEdit.textChanged.connect(self.applyFilter)
+        lay.addWidget(self.searchEdit)
         self.list = QListWidget(self)
         self.items = []
         if os.path.isdir(EXAMPLES_DIR):
@@ -780,12 +877,19 @@ class ExampleDialog(QDialog):
                 if os.path.isfile(code):
                     with open(code, "r", encoding="utf-8", errors="ignore") as f:
                         text = f.read()
-                    first = text.splitlines()[0].strip(" /=-") if text.strip() else ""
+                    first = text.splitlines()[0].strip(" /=- ") if text.strip() else ""
                     item = QListWidgetItem(f"{d}   ——  {first}")
-                    self.items.append((item, code, d))
+                    self.items.append((item, code, d, first))
                     self.list.addItem(item)
         lay.addWidget(self.list)
         self.list.itemDoubleClicked.connect(self.accept)
+
+    def applyFilter(self, kw):
+        """按名字/注释关键字过滤示例列表"""
+        kw = self.searchEdit.text().strip().lower()
+        for item, code, d, first in self.items:
+            hit = (not kw) or kw in d.lower() or kw in first.lower()
+            item.setHidden(not hit)
 
     def showEvent(self, e):
         super().showEvent(e)
@@ -811,6 +915,12 @@ class MainWindow(QMainWindow):
         self.errorLines = []
         self.serial = QSerialPort(self)
         self.serial.readyRead.connect(self.onSerialData)
+
+        # 自动保存：每 30 秒静默存一次所有已命名的文件（没起名的文件不自动命名）
+        self._autosaveTimer = QTimer(self)
+        self._autosaveTimer.setInterval(30000)
+        self._autosaveTimer.timeout.connect(self.autosave)
+        self._autosaveTimer.start()
 
         # ---- 编辑器区：多文件标签（像小熊猫/PyCharm 一样来回切） ----
         # 启动时不开任何标签：啥也没有，点「新建」才建文件
@@ -844,6 +954,25 @@ class MainWindow(QMainWindow):
         ol.addWidget(self.progressLabel)
         ol.addWidget(self.progressBar)
         ol.addWidget(self.output)
+        # 串口发送行：打开串口后可以给板子发指令（回车或点按钮）
+        sendRow = QWidget()
+        sr = QHBoxLayout(sendRow)
+        sr.setContentsMargins(8, 2, 8, 4)
+        sr.setSpacing(6)
+        self.sendEdit = QLineEdit()
+        self.sendEdit.setPlaceholderText("给板子发指令（回车发送；末尾自动加换行）")
+        self.sendEdit.setEnabled(False)
+        self.sendEdit.returnPressed.connect(self.sendSerial)
+        self.sendNlCheck = QPushButton("换行 ✔")
+        self.sendNlCheck.setCheckable(True)
+        self.sendNlCheck.setChecked(True)
+        self.sendNlCheck.setToolTip("发送时末尾自动加换行（板子一般按行读取）")
+        sendBtn = QPushButton("发送")
+        sendBtn.clicked.connect(self.sendSerial)
+        sr.addWidget(self.sendEdit, 1)
+        sr.addWidget(self.sendNlCheck)
+        sr.addWidget(sendBtn)
+        ol.addWidget(sendRow)
 
         splitter = QSplitter(Qt.Vertical)
         splitter.addWidget(self.tabs)
@@ -916,6 +1045,7 @@ class MainWindow(QMainWindow):
         tb.addSeparator()
         self._add(tb, "编译", "编译检查（不用接板子）", self.build)
         self._add(tb, "烧录", "编译并烧录到板子", self.upload)
+        self._add(tb, "停止", "停止正在进行的编译/烧录", self.stopProc)
         self._add(tb, "串口", "打开/关闭串口监视", self.toggleSerial)
 
         self.refreshPorts()
@@ -1018,6 +1148,8 @@ class MainWindow(QMainWindow):
         ed = self.tabs.widget(idx)
         if ed is None:
             return
+        # 切标签时，把所有已命名且有改动的文件静默存一遍（不弹窗、不动标签名）
+        self.autosave()
         self.currentFile = getattr(ed, "filePath", None)
         # 窗口还没搭完时（状态栏未创建）不刷状态，避免启动报错
         if not hasattr(self, "statusLabel"):
@@ -1026,6 +1158,24 @@ class MainWindow(QMainWindow):
             self.statusLabel.setText(os.path.basename(self.currentFile))
         else:
             self.statusLabel.setText(self.tabs.tabText(idx) + "（还没存盘，点保存会先起名）")
+
+    def autosave(self):
+        """静默自动保存：只存「已命名且内容有改动」的标签。
+        不弹窗、不自动起名、不改标签名——未命名的新手文件等他自己点保存。"""
+        for i in range(self.tabs.count()):
+            w = self.tabs.widget(i)
+            if w is None:
+                continue
+            p = getattr(w, "filePath", None)
+            if not p or not os.path.isfile(p):
+                continue
+            try:
+                with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                    if f.read() != w.toPlainText():
+                        with open(p, "w", encoding="utf-8") as f2:
+                            f2.write(w.toPlainText())
+            except OSError:
+                pass
 
     def closeTab(self, idx):
         ed = self.tabs.widget(idx)
@@ -1304,6 +1454,15 @@ class MainWindow(QMainWindow):
                 self, label,
                 "现在还没有文件。先点「新建」建一个文件，或点「示例」选个例子。")
             return
+        if not os.path.isfile(PIO_EXE):
+            QMessageBox.warning(
+                self, label,
+                "没找到 pio 编译器（pio.exe）。\n\n"
+                "1. 安装 PlatformIO（VS Code 里装 PlatformIO 插件即可）；\n"
+                "2. 或把 D:\\platformio-core 拷到这台电脑；\n"
+                "3. 或改 NanoCode.py 顶部的 PIO_EXE 路径。\n\n"
+                "编辑器功能不受影响，可以继续写代码。")
+            return
         ini = os.path.join(self.projectDir, "platformio.ini")
         if not os.path.isfile(ini):
             QMessageBox.warning(self, "项目不对",
@@ -1361,6 +1520,16 @@ class MainWindow(QMainWindow):
         # 只编译当前这一个文件：给 platformio.ini 加 src_filter，编完立刻恢复
         self._patch_ini_for_single_file(os.path.basename(target))
 
+        # 首次编译这个项目：要先下载/准备依赖，提前打招呼，别让新手以为卡死
+        if not os.path.isdir(os.path.join(self.projectDir, ".pio")):
+            QMessageBox.information(
+                self, "第一次编译",
+                "这是第一次编译这个项目，要先准备编译工具和依赖，"
+                "可能要几分钟。\n\n别关窗口、别拔线，等进度条走完就行。\n"
+                "第二次开始就会快很多。")
+            self.output.append(
+                "<span style='color:#e5c07b'>ℹ 第一次编译要下依赖，耐心等几分钟，别关窗口</span>")
+
         env = os.environ.copy()
         env["PLATFORMIO_CORE_DIR"] = PLATFORMIO_CORE_DIR
         env["PATH"] = env.get("PATH", "") + r";D:\Git\cmd"
@@ -1382,6 +1551,17 @@ class MainWindow(QMainWindow):
         p.finished.connect(lambda code, st: self.onProcFinished(code, label))
         p.start(PIO_EXE, args)
         self.process = p
+        self._stopped = False
+
+    def stopProc(self):
+        """停止正在进行的编译/烧录（点了没反应/卡住时用）"""
+        if self.process and self.process.state() != QProcess.NotRunning:
+            self._stopped = True
+            self.process.kill()
+            self.progressBar.finish(False)
+            self._restore_ini()
+            self.output.append("<span style='color:#e5c07b'>■ 正在停止…</span>")
+            self.statusLabel.setText("正在停止…")
 
     def _patch_ini_for_single_file(self, fname):
         """在 platformio.ini 里把编译范围限定到当前文件（src_filter）。
@@ -1457,6 +1637,12 @@ class MainWindow(QMainWindow):
                 self.refreshPorts()
                 self.statusLabel.setText("烧录完成 ✔ 想看板子输出？点上方「打开串口」")
         else:
+            if getattr(self, "_stopped", False):
+                self._stopped = False
+                self.output.append("<span style='color:#e5c07b'>■ 已停止</span>")
+                self.statusLabel.setText("已停止")
+                self.progressLabel.setText("已停止")
+                return
             self.output.append(f"<span style='color:#e06c75'>✘ {label}出错（代码 {code}）</span>")
             if self.errorLines:
                 first = self.errorLines[0]
@@ -1464,8 +1650,17 @@ class MainWindow(QMainWindow):
                 self.jumpToLine(first)
                 self.statusLabel.setText(f"{label}失败 ✘ 第 {first} 行有错（点输出里的红字可跳转）")
                 self.progressLabel.setText(f"✘ 第 {first} 行有错，光标已跳过去")
+                self.output.append(
+                    "<span style='color:#e5c07b'>💡 编译错多半是：忘了加分号 ; 、"
+                    "括号没配对、单词拼错。点上面红字直接跳到出错行。</span>")
             else:
                 self.statusLabel.setText(f"{label}失败 ✘ 看上面红字")
+                self.progressLabel.setText(f"✘ {label}失败")
+                if label == "烧录":
+                    self.output.append(
+                        "<span style='color:#e5c07b'>💡 烧录连不上常见原因："
+                        "① USB 线没插好或只能充电不能传数据；② COM 口没选对；"
+                        "③ 板子驱动没装；④ 板子被其他程序占用。</span>")
 
     def jumpToLine(self, ln):
         block = self.editor.document().findBlockByNumber(ln - 1)
@@ -1506,6 +1701,7 @@ class MainWindow(QMainWindow):
             self.serial.close()
             self.serialBtn.setText("打开串口")
             self.serialBtn.setStyleSheet("")
+            self.sendEdit.setEnabled(False)
             self.statusLabel.setText("串口已关闭")
             return
         name = self.comCombo.currentData()
@@ -1523,10 +1719,30 @@ class MainWindow(QMainWindow):
             self.serialBtn.setStyleSheet(
                 "QPushButton{background:#1f6e43;border:1px solid #4ade80;"
                 "border-radius:10px;padding:7px 14px;font-size:13px;color:#ffffff;}")
+            self.sendEdit.setEnabled(True)
+            self.sendEdit.setFocus()
             self.statusLabel.setText(f"串口 {name} 已打开（波特率 {self.baudCombo.currentText()}）")
         else:
             err = self.serial.errorString()
             QMessageBox.warning(self, "串口", f"打不开 {name}：{err}\n可能被其他程序占用，或不是 USB 串口。")
+
+    def sendSerial(self):
+        """把发送框里的指令写给板子（打开串口后才能发）"""
+        if not self.serial.isOpen():
+            self.statusLabel.setText("串口没开，先点「打开串口」")
+            self.toast("先点「打开串口」才能发指令哦", "#e5c07b")
+            return
+        text = self.sendEdit.text()
+        if not text.strip():
+            return
+        if self.sendNlCheck.isChecked() and not text.endswith("\n"):
+            text += "\n"
+        self.serial.write(text.encode("utf-8"))
+        shown = text.replace("\n", "↵")
+        self.output.append(f"<span style='color:#61afef'>→ 发送: {shown}</span>")
+        sb = self.output.verticalScrollBar()
+        sb.setValue(sb.maximum())
+        self.sendEdit.clear()
 
     def onSerialData(self):
         data = bytes(self.serial.readAll()).decode("utf-8", errors="replace")
@@ -1576,6 +1792,7 @@ class MainWindow(QMainWindow):
 
 
 def main():
+    detect_paths()
     scan_arduino_headers()
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
