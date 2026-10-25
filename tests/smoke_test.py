@@ -67,12 +67,8 @@ check("while/else/switch 都有固定句式模板",
 check("Serial.begin 有模板", "Serial.begin($1);" in sns.get("Serial.begin", ""))
 check("include 模板补全成 #include <...>", sns.get("include") == "#include <$1>")
 check("setup/loop 模板补全成 void setup()/void loop()",
-      sns.get("setup") == "void setup() {
-    $1
-}" and
-      sns.get("loop") == "void loop() {
-    $1
-}")
+      sns.get("setup") == "void setup() {\n    $1\n}" and
+      sns.get("loop") == "void loop() {\n    $1\n}")
 
 # 6. 补全弹窗数据（QStandardItemModel 自定义角色）
 ed = C.CodeEditor()
@@ -196,3 +192,4 @@ check("改进7：词库无 BLEAdvertizer 错别字",
 
 print("\n结果：%d 项通过，%d 项失败" % (34 - len(FAILS), len(FAILS)))
 sys.exit(1 if FAILS else 0)
+"
