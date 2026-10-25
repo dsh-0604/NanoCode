@@ -89,10 +89,12 @@ m2 = ed2._completionModel
 names2 = [m2.data(m2.index(i, 0), Qt.DisplayRole) for i in range(m2.rowCount())]
 check("输入 Serial. 弹出成员函数", "Serial.begin" in names2 and "Serial.println" in names2)
 
-# 7. 多文件标签：开第二个文件，新开标签页并切换，内容不串
+# 7. 多文件标签：开第二个文件，新开标签页并切换，内容不串，旧文件不被删
 before = win.tabs.count()
 win.newFile("second")
 check("多标签：再建一个文件后多开 1 个标签", win.tabs.count() == before + 1)
+check("新建不删旧文件：smoke.cpp 还在磁盘上",
+      os.path.isfile(os.path.join(win.projectDir, "src", "smoke.cpp")))
 check("当前标签是第二个文件", win.currentFile is not None and win.currentFile.endswith("second.cpp"))
 # 切回第一个标签，编辑器内容还是第一个文件
 win.tabs.setCurrentIndex(0)
@@ -102,7 +104,7 @@ win.tabs.setCurrentIndex(1)
 check("切到第二个标签，内容是新文件模板", win.editor.toPlainText().startswith("#include <Arduino.h>"))
 
 # 8. 保存指定编辑器（关标签时存被关的那个，而不是当前页）
-# tabs 顺序：0=smoke（已被新建 second 时从磁盘删掉）、1=示例、2=second
+# tabs 顺序：0=smoke、1=示例：01_点灯、2=second
 w2 = win.tabs.widget(2)   # second.cpp（有真实文件）
 w2.setPlainText("// 这是第二个文件的独特内容\n" + w2.toPlainText())
 win.tabs.setCurrentIndex(0)   # 当前页是 smoke
@@ -114,6 +116,9 @@ check("保存指定编辑器：没有误改当前页文件", win.editor.toPlainT
 # 保存后当前页没变，第二个文件内容仍在内存里
 win.tabs.setCurrentIndex(2)
 check("保存指定编辑器：被保存文件内容保留", win.editor.toPlainText().startswith("// 这是第二个文件的独特内容"))
+# 保存后标签名 = 磁盘文件名（铁律）
+check("保存后标签名=磁盘文件名（second.cpp）",
+      win.tabs.tabText(win.tabs.indexOf(w2)) == "second.cpp")
 
 # 8.5 默认名推导（新手友好：示例名直接当文件名；未命名残留回退 main）
 win._newEditorTab("示例：01_点灯", None)
@@ -125,5 +130,5 @@ idx = win.tabs.count() - 1
 check("默认名推导：示例（未命名）→ main",
       win._defaultNameFromLabel(win.tabs.widget(idx)) == "main")
 
-print("\n结果：%d 项通过，%d 项失败" % (26 - len(FAILS), len(FAILS)))
+print("\n结果：%d 项通过，%d 项失败" % (28 - len(FAILS), len(FAILS)))
 sys.exit(1 if FAILS else 0)
