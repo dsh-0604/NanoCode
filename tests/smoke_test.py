@@ -115,5 +115,15 @@ check("保存指定编辑器：没有误改当前页文件", win.editor.toPlainT
 win.tabs.setCurrentIndex(2)
 check("保存指定编辑器：被保存文件内容保留", win.editor.toPlainText().startswith("// 这是第二个文件的独特内容"))
 
-print("\n结果：%d 项通过，%d 项失败" % (24 - len(FAILS), len(FAILS)))
+# 8.5 默认名推导（新手友好：示例名直接当文件名；未命名残留回退 main）
+win._newEditorTab("示例：01_点灯", None)
+idx = win.tabs.count() - 1
+check("默认名推导：示例：01_点灯 → 01_点灯",
+      win._defaultNameFromLabel(win.tabs.widget(idx)) == "01_点灯")
+win._newEditorTab("示例（未命名）", None)
+idx = win.tabs.count() - 1
+check("默认名推导：示例（未命名）→ main",
+      win._defaultNameFromLabel(win.tabs.widget(idx)) == "main")
+
+print("\n结果：%d 项通过，%d 项失败" % (26 - len(FAILS), len(FAILS)))
 sys.exit(1 if FAILS else 0)
