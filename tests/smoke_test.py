@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+"# -*- coding: utf-8 -*-
 """NanoCode 冒烟测试（无界面运行，一分钟内跑完）
 用法：python tests/smoke_test.py
 检查：能启动主窗口、新建文件有基础模板、示例能载入、补全去重、模板补全数据正确。
@@ -28,6 +28,11 @@ app.setStyle("Fusion")
 
 # 1. 主窗口能启动
 win = C.MainWindow()
+# 跑前清理上次测试留下的 smoke.cpp/second.cpp（有残留的话 newFile 同名会弹窗卡住）
+for f in ("smoke.cpp", "second.cpp"):
+    fp = os.path.join(win.projectDir, "src", f)
+    if os.path.isfile(fp):
+        os.remove(fp)
 check("主窗口能启动，标题含 NanoCode", "NanoCode" in win.windowTitle())
 check("启动时没有任何空标签（点新建才建文件）", win.tabs.count() == 0)
 
@@ -62,8 +67,12 @@ check("while/else/switch 都有固定句式模板",
 check("Serial.begin 有模板", "Serial.begin($1);" in sns.get("Serial.begin", ""))
 check("include 模板补全成 #include <...>", sns.get("include") == "#include <$1>")
 check("setup/loop 模板补全成 void setup()/void loop()",
-      sns.get("setup") == "void setup() {\n    $1\n}" and
-      sns.get("loop") == "void loop() {\n    $1\n}")
+      sns.get("setup") == "void setup() {
+    $1
+}" and
+      sns.get("loop") == "void loop() {
+    $1
+}")
 
 # 6. 补全弹窗数据（QStandardItemModel 自定义角色）
 ed = C.CodeEditor()
@@ -130,5 +139,60 @@ idx = win.tabs.count() - 1
 check("默认名推导：示例（未命名）→ main",
       win._defaultNameFromLabel(win.tabs.widget(idx)) == "main")
 
-print("\n结果：%d 项通过，%d 项失败" % (28 - len(FAILS), len(FAILS)))
+# 9. Bug1：片段补全后光标停在 $1 空位（for 模板带换行缩进）
+ed3 = C.CodeEditor()
+ed3.setPlainText("for")
+cur3 = ed3.textCursor()
+cur3.movePosition(QTextCursor.MoveOperation.End)
+ed3.setTextCursor(cur3)
+ed3.completer.setCompletionPrefix("for")
+ed3._insertSnippet(__import__("keywords").SNIPPETS["for"])
+text3 = ed3.toPlainText()
+pos3 = ed3.textCursor().position()
+exp3 = len("for (int i = 0; i < 10; i++) {\n    ")
+check("Bug1：for 补全后文本正确", text3 == "for (int i = 0; i < 10; i++) {\n    \n}")
+check("Bug1：for 补全后光标停在空位（$1 处）",
+      pos3 == exp3 and text3[exp3] == "\n")
+
+# 10. Bug2：} else 回车后下一行缩进要进一级
+ed4 = C.CodeEditor()
+ed4.setPlainText("  if (x) {\n  } else")
+cur4 = ed4.textCursor()
+cur4.movePosition(QTextCursor.MoveOperation.End)
+ed4.setTextCursor(cur4)
+ed4.autoIndent()
+line4 = ed4.textCursor().block().text()
+check("Bug2：} else 回车后下一行进一级缩进",
+      line4.strip() == "" and line4.startswith("    ") and len(line4) >= 4)
+
+# 11. Bug3：编译报错解析支持 Windows 绝对路径（D:\...）
+m3 = C.ERR_RE.search(r"D:\PlatformIO\c3_blink\src\main.cpp:7:5: error: bar")
+check("Bug3：绝对路径解析出完整文件名",
+      m3 is not None and m3.group(1) == r"D:\PlatformIO\c3_blink\src\main.cpp"
+      and m3.group(2) == "7")
+
+# 12. Bug4：pM 补全噪声（pinMode 第一且分数拉开）
+res_pm = C.build_completion_list("pM")
+names_pm = [n for n, d, s, k in res_pm]
+check("Bug4：pM 补全第一位是 pinMode", names_pm and names_pm[0] == "pinMode")
+score_pm = dict((n, s) for n, d, s, k in res_pm)
+gap_ok = all(score_pm["pinMode"] - s >= 15
+             for n, s in ((n, s) for n, d, s, k in res_pm) if n != "pinMode")
+check("Bug4：pinMode 与噪声候选分数拉开 ≥15", gap_ok)
+
+# 13. Bug5：一行多语句漏分号被检测
+ed5 = C.CodeEditor()
+ed5.setPlainText("void loop(){ digitalWrite(8, HIGH) }")
+check("Bug5：一行多语句漏分号被检测", len(ed5.findMissingSemicolons()) > 0)
+ed5b = C.CodeEditor()
+ed5b.setPlainText("void loop(){ digitalWrite(8, HIGH); }")
+check("Bug5：已加分号的一行多语句不误报", len(ed5b.findMissingSemicolons()) == 0)
+
+# 14. 改进7：词库无 BLEAdvertizer 错别字
+KW2 = __import__("keywords")
+kw_names = [n for n, _ in KW2.ARDUINO_KEYWORDS]
+check("改进7：词库无 BLEAdvertizer 错别字",
+      "BLEAdvertizer" not in kw_names and "BLEAdvertiser" in kw_names)
+
+print("\n结果：%d 项通过，%d 项失败" % (34 - len(FAILS), len(FAILS)))
 sys.exit(1 if FAILS else 0)
