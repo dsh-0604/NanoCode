@@ -887,7 +887,7 @@ class ExampleDialog(QDialog):
                 if os.path.isfile(code):
                     with open(code, "r", encoding="utf-8", errors="ignore") as f:
                         text = f.read()
-                    first = text.splitlines()[0].strip(" /=- ") if text.strip() else ""
+                    first = text.splitlines()[0].strip(" /=-") if text.strip() else ""
                     item = QListWidgetItem(f"{d}   ——  {first}")
                     self.items.append((item, code, d, first))
                     self.list.addItem(item)
