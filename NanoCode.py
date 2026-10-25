@@ -967,6 +967,15 @@ class MainWindow(QMainWindow):
         elif act == act_close:
             self.closeTab(tab)
 
+    def _cleanNameForFile(self, s):
+        """把标签名/用户输入变成合法文件名：
+        清掉“示例：”前缀、中文括号里的说明文字、Windows 非法字符"""
+        s = s.replace("示例：", "").replace("示例", "")
+        s = re.sub(r"（[^（）]*）", "", s)
+        for ch in '\\/:*?"<>|':
+            s = s.replace(ch, "_")
+        return s.strip()
+
     def renameTab(self, idx):
         """重命名：给文件起新名字（自动 .cpp），磁盘文件、标签、绑定一起改"""
         ed = self.tabs.widget(idx)
@@ -975,7 +984,7 @@ class MainWindow(QMainWindow):
         old_path = getattr(ed, "filePath", None)
         old_name = self.tabs.tabText(idx)
         default = os.path.basename(old_path) if old_path else old_name
-        default = default.replace("示例：", "")
+        default = self._cleanNameForFile(default)
         if default.lower().endswith(".cpp"):
             default = default[:-4]
         name, ok = QInputDialog.getText(
@@ -1057,20 +1066,15 @@ class MainWindow(QMainWindow):
     # ---------- 文件 ----------
     def newFile(self, name=None):
         """新建文件：先让用户输入名字（强制 .cpp 结尾），
-        然后真的在 src 下创建这个文件，以后保存/编译都针对它。
-        name 参数供测试用（弹窗会挡住自动化）。"""
+        然后真的在 src 下创建这个文件。
+        绝不删除任何已有文件——多个文件可以并存，编译时只编当前那个。"""
         if name is None:
             # 默认名 = 当前标签上显示的名字（去掉“示例：”），少打一次字
             # 先把窗口顶到最前面，免得弹窗被盖住看起来像“没反应”
             self.raise_()
             self.activateWindow()
             cur = self.tabs.tabText(self.tabs.currentIndex()) or ""
-            default = cur.replace("示例：", "").replace("示例", "")
-            for ch in '\\/:*?"<>|':
-                default = default.replace(ch, "_")
-            default = default.strip()
-            if not default or default == "未命名":
-                default = "main"
+            default = self._cleanNameForFile(cur) or "main"
             name, ok = QInputDialog.getText(
                 self, "新建文件",
                 "给新文件起个名字（不用打 .cpp，自动给你加上）：",
@@ -1078,45 +1082,28 @@ class MainWindow(QMainWindow):
             if not ok or not name.strip():
                 self.statusLabel.setText("已取消新建")
                 return
-        name = name.strip()
+        name = self._cleanNameForFile(name)
         # 强制 .cpp 结尾：不管用户输什么，最后一定是 xxx.cpp
         if not name.lower().endswith(".cpp"):
             name += ".cpp"
-        # 去掉 Windows 不允许的字符，防止路径出错
-        for ch in '\\/:*?"<>|':
-            name = name.replace(ch, "_")
         src_dir = os.path.join(self.projectDir, "src")
         os.makedirs(src_dir, exist_ok=True)
         target = os.path.join(src_dir, name)
-        # 单文件模式：src 里只能有一个 .cpp，否则多个 setup/loop 会编译冲突。
-        # 新建 = 换一个新程序，所以把旧的 .cpp 清掉（会提示你删了谁）。
-        removed = []
-        if os.path.isdir(src_dir):
-            for f in os.listdir(src_dir):
-                p = os.path.join(src_dir, f)
-                if (f.lower().endswith(".cpp") and p != target
-                        and os.path.isfile(p)):
-                    try:
-                        os.remove(p)
-                        removed.append(f)
-                    except OSError:
-                        pass
-                    # 这个旧文件如果还开在某个标签里：让标签变成“未命名”，
-                    # 免得标签还指着已经不存在的文件
-                    for i in range(self.tabs.count()):
-                        w = self.tabs.widget(i)
-                        if w is not None and getattr(w, "filePath", None) == p:
-                            w.filePath = None
-                            self.tabs.setTabText(
-                                i, self.tabs.tabText(i) + "（文件已删，另存为新名）")
+        # 同名文件已存在：先问用户，绝不偷偷覆盖
+        if os.path.isfile(target):
+            r = QMessageBox.question(
+                self, "文件已存在",
+                f"{name} 已经存在，要覆盖吗？（会丢掉原来的内容）",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if r != QMessageBox.Yes:
+                self.statusLabel.setText("已取消新建（同名文件已存在）")
+                return
         with open(target, "w", encoding="utf-8") as f:
             f.write(DEFAULT_TEMPLATE)
         ed = self._newEditorTab(name, target)
         ed.setPlainText(DEFAULT_TEMPLATE)
         self.currentFile = target
-        msg = f"新文件 {name}"
-        if removed:
-            msg += f"（已移除旧文件 {', '.join(removed)}，保持单文件不冲突）"
+        msg = "新文件 " + name
         self.statusLabel.setText(msg)
         self.toast(msg)
 
@@ -1149,14 +1136,10 @@ class MainWindow(QMainWindow):
         self.saveEditor(self.editor)
 
     def _defaultNameFromLabel(self, ed):
-        """从标签名推导“默认文件名”：去掉“示例：”前缀和“（未命名）”残留，
+        """从标签名推导“默认文件名”：清掉“示例：”前缀和所有中文括号残留，
         再不行就回退 main。保证存出来的文件名不奇怪。"""
         cur = self.tabs.tabText(self.tabs.indexOf(ed)) or ""
-        default = cur.replace("示例：", "").replace("示例", "")
-        default = default.replace("（未命名）", "").replace("未命名", "")
-        for ch in '\\/:*?"<>|':
-            default = default.replace(ch, "_")
-        default = default.strip()
+        default = self._cleanNameForFile(cur)
         if not default:
             default = "main"
         return default
@@ -1164,13 +1147,14 @@ class MainWindow(QMainWindow):
     def saveEditor(self, ed):
         """把【指定编辑器】的内容存到它自己的文件。
         传 ed 而不是只存当前页——关标签时存被关的那个，才不会存错文件。
+        铁律：保存后标签名 = 磁盘文件名（永远同步）。
         返回 True=保存成功，False=用户取消了命名（没存上）。"""
         if ed is None:
             return False
         p = getattr(ed, "filePath", None)
         if not p:
             # 还没命名：从标签名推导默认名，只起名保存，
-            # 不删任何文件（删旧文件只有主动点“新建”才做）。
+            # 绝不删除任何文件（覆盖同名文件前会先问）。
             default = self._defaultNameFromLabel(ed)
             name, ok = QInputDialog.getText(
                 self, "保存文件",
@@ -1179,18 +1163,26 @@ class MainWindow(QMainWindow):
             if not ok or not name.strip():
                 self.statusLabel.setText("已取消保存")
                 return False
-            name = name.strip()
+            name = self._cleanNameForFile(name)
             if not name.lower().endswith(".cpp"):
                 name += ".cpp"
-            for ch in '\\/:*?"<>|':
-                name = name.replace(ch, "_")
             src_dir = os.path.join(self.projectDir, "src")
             os.makedirs(src_dir, exist_ok=True)
             p = os.path.join(src_dir, name)
+            if os.path.isfile(p):
+                r = QMessageBox.question(
+                    self, "文件已存在",
+                    f"{name} 已经存在，要覆盖吗？（会丢掉原来的内容）",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+                if r != QMessageBox.Yes:
+                    self.statusLabel.setText("已取消保存（同名文件已存在）")
+                    return False
             ed.filePath = p
             self.tabs.setTabText(self.tabs.indexOf(ed), name)
         with open(p, "w", encoding="utf-8") as f:
             f.write(ed.toPlainText())
+        # 铁律：保存后，标签名永远 = 磁盘文件名（清掉任何残留后缀）
+        self.tabs.setTabText(self.tabs.indexOf(ed), os.path.basename(p))
         if self.tabs.currentWidget() is ed:
             self.currentFile = p
         self.statusLabel.setText("已保存 " + p)
@@ -1332,24 +1324,42 @@ class MainWindow(QMainWindow):
             self.statusLabel.setText(f"已自动补 {len(fixes)} 处分号，继续{label}")
             self.toast(f"帮你补了 {len(fixes)} 处分号 ; 下次记得自己加哦")
 
-        # 烧录/编译前：先把编辑器里的代码自动保存到“当前文件”（新建时定的名字）
-        # 不然 IDE 编译的是磁盘上的旧代码，你改的没保存就白改了。
-        src_dir = os.path.join(self.projectDir, "src")
+        # 编译/烧录前：确保当前文件已命名并保存（未命名就先起名保存，取消就中断）
         ed = self.editor
         target = getattr(ed, "filePath", None)
-        # 如果还没命名 / 文件被挪走 / 打开的是 src 外的文件：兜底用 src\main.cpp
-        if (not target or os.path.dirname(target) != src_dir
-                or not os.path.isfile(target)):
-            os.makedirs(src_dir, exist_ok=True)
-            target = os.path.join(src_dir, "main.cpp")
-            ed.filePath = target
-            # 标签也跟着改成 main.cpp，免得标签名和磁盘文件名对不上
-            self.tabs.setTabText(self.tabs.indexOf(ed), "main.cpp")
+        if not target or not os.path.isfile(target):
+            if not self.saveEditor(ed):
+                self.statusLabel.setText(f"已取消{label}（文件还没存盘）")
+                return
+            target = ed.filePath
+        src_dir = os.path.join(self.projectDir, "src")
+        if os.path.dirname(os.path.abspath(target)) != os.path.abspath(src_dir):
+            # 打开的是项目外的文件：先另存到项目 src 下再编译
+            new_target = os.path.join(src_dir, os.path.basename(target))
+            if os.path.isfile(new_target):
+                r = QMessageBox.question(
+                    self, "文件已存在",
+                    f"项目里已有 {os.path.basename(target)}，"
+                    "要覆盖成当前内容吗？",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+                if r != QMessageBox.Yes:
+                    self.statusLabel.setText(f"已取消{label}")
+                    return
+            with open(new_target, "w", encoding="utf-8") as f:
+                f.write(ed.toPlainText())
+            ed.filePath = new_target
+            target = new_target
+            # 标签名 = 磁盘文件名，保持同步
+            self.tabs.setTabText(self.tabs.indexOf(ed), os.path.basename(target))
+        # 保存当前编辑器内容到文件（防止编译的是磁盘上的旧代码）
         with open(target, "w", encoding="utf-8") as f:
             f.write(ed.toPlainText())
         self.currentFile = target
         self.output.append(
             f"<span style='color:#98c379'>✔ 已自动保存编辑器内容 → {target}</span>")
+
+        # 只编译当前这一个文件：给 platformio.ini 加 src_filter，编完立刻恢复
+        self._patch_ini_for_single_file(os.path.basename(target))
 
         env = os.environ.copy()
         env["PLATFORMIO_CORE_DIR"] = PLATFORMIO_CORE_DIR
@@ -1372,6 +1382,44 @@ class MainWindow(QMainWindow):
         p.finished.connect(lambda code, st: self.onProcFinished(code, label))
         p.start(PIO_EXE, args)
         self.process = p
+
+    def _patch_ini_for_single_file(self, fname):
+        """在 platformio.ini 里把编译范围限定到当前文件（src_filter）。
+        备份原 ini，编译结束后恢复，不破坏用户自己的配置。"""
+        ini = os.path.join(self.projectDir, "platformio.ini")
+        try:
+            with open(ini, "r", encoding="utf-8") as f:
+                content = f.read()
+        except OSError:
+            return
+        self._ini_backup = content
+        line = f"src_filter = +<{fname}>"
+        if re.search(r"^\s*src_filter\s*=", content, re.M):
+            new = re.sub(r"(?m)^\s*src_filter\s*=.*$", line, content)
+        else:
+            m = re.search(r"\[[^\]]*\]", content)
+            if not m:
+                new = content.rstrip() + "\n" + line + "\n"
+            else:
+                # 在第一个环境区块的末尾插入
+                nxt = re.search(r"\n\s*\[", content[m.end():])
+                ins = m.end() + nxt.start() if nxt else len(content)
+                new = content[:ins].rstrip() + "\n" + line + "\n" + content[ins:].lstrip()
+        with open(ini, "w", encoding="utf-8") as f:
+            f.write(new)
+
+    def _restore_ini(self):
+        """编译/烧录结束后恢复 platformio.ini 原样"""
+        backup = getattr(self, "_ini_backup", None)
+        if not backup:
+            return
+        ini = os.path.join(self.projectDir, "platformio.ini")
+        try:
+            with open(ini, "w", encoding="utf-8") as f:
+                f.write(backup)
+        except OSError:
+            pass
+        self._ini_backup = None
 
     def readProc(self, data):
         try:
@@ -1399,6 +1447,7 @@ class MainWindow(QMainWindow):
 
     def onProcFinished(self, code, label):
         self.progressBar.finish(code == 0)
+        self._restore_ini()
         if code == 0:
             self.output.append(f"<span style='color:#98c379'>✔ {label}完成！</span>")
             self.statusLabel.setText(f"{label}完成 ✔")
