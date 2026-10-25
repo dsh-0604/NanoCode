@@ -162,9 +162,9 @@ check("Bug2：} else 回车后下一行进一级缩进",
       line4.strip() == "" and line4.startswith("    ") and len(line4) >= 4)
 
 # 11. Bug3：编译报错解析支持 Windows 绝对路径（D:\...）
-m3 = C.ERR_RE.search(r"D:\PlatformIO\c3_blink\src\main.cpp:7:5: error: bar")
+m3 = C.ERR_RE.search(r"D:\\PlatformIO\\c3_blink\\src\\main.cpp:7:5: error: bar")
 check("Bug3：绝对路径解析出完整文件名",
-      m3 is not None and m3.group(1) == r"D:\PlatformIO\c3_blink\src\main.cpp"
+      m3 is not None and m3.group(1) == r"D:\\PlatformIO\\c3_blink\\src\\main.cpp"
       and m3.group(2) == "7")
 
 # 12. Bug4：pM 补全噪声（pinMode 第一且分数拉开）
