@@ -9,10 +9,11 @@ import os
 import re
 import sys
 import glob
+import shutil
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QPlainTextEdit, QTextEdit, QTextBrowser, QToolBar,
-    QCompleter, QComboBox, QLabel, QVBoxLayout, QHBoxLayout,
+    QCompleter, QComboBox, QCheckBox, QLabel, QVBoxLayout, QHBoxLayout,
     QWidget, QFileDialog, QMessageBox, QLineEdit, QPushButton, QSplitter,
     QStyledItemDelegate, QListWidget, QListWidgetItem, QDialog, QStyle,
     QGraphicsOpacityEffect, QInputDialog, QTabWidget, QTabBar, QMenu
@@ -44,12 +45,14 @@ FRAMEWORK_CORES = r"D:\platformio-core\packages\framework-arduinoespressif32\cor
 FRAMEWORK_LIBS = r"D:\platformio-core\packages\framework-arduinoespressif32\libraries"
 EXAMPLES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "examples")
 
+# git 目录：编译时拼进 PATH（PlatformIO 有些库要 git 拉取）。
+# detect_paths() 会实际探测，找不到就清空，绝不硬编码死路径。
+GIT_CMD_DIR = r"D:\Git\cmd"
+
 def detect_paths():
     """换电脑也能用：默认路径不存在时，自动去 PATH 里找 pio.exe / git。
     找不到就保持原路径，编译时再给友好提示。"""
-    global PIO_EXE, PLATFORMIO_CORE_DIR, FRAMEWORK_CORES, FRAMEWORK_LIBS
-    if os.path.isfile(PIO_EXE):
-        return
+    global PIO_EXE, PLATFORMIO_CORE_DIR, FRAMEWORK_CORES, FRAMEWORK_LIBS, GIT_CMD_DIR
     for d in os.environ.get("PATH", "").split(";"):
         cand = os.path.join(d, "pio.exe")
         if os.path.isfile(cand):
@@ -62,6 +65,13 @@ def detect_paths():
                 PLATFORMIO_CORE_DIR, "packages",
                 "framework-arduinoespressif32", "libraries")
             break
+    # git 探测：PATH 里有 git.exe 就用它；默认路径有效就保持；否则清空（不硬编码）
+    g = shutil.which("git")
+    if g:
+        GIT_CMD_DIR = os.path.dirname(g)
+    elif not (os.path.isdir(GIT_CMD_DIR)
+              and os.path.isfile(os.path.join(GIT_CMD_DIR, "git.exe"))):
+        GIT_CMD_DIR = ""
 
 # 新建文件默认模板：写硬件的固定骨架，每次新建自动带上
 DEFAULT_TEMPLATE = (
@@ -80,7 +90,7 @@ DEFAULT_TEMPLATE = (
 
 # ==================== 自动扫描头文件补充词库 ====================
 EXTRA_FUNCTIONS = set()
-_FUNC_RE = re.compile(r"\b([a-zA-Z_]\w*)\s*\(")
+_FUNC_RE = re.compile(r"\b([a-zA-Z_]\w*)\s*\\(")
 
 def scan_arduino_headers():
     dirs = [FRAMEWORK_CORES]
@@ -215,7 +225,7 @@ class CppHighlighter(QSyntaxHighlighter):
             r"\b(" + "|".join(k for k, _ in KW.CORE_KEYWORDS) + r")\b"), kw))
         func = QTextCharFormat()
         func.setForeground(QColor("#61afef"))
-        self.rules.append((re.compile(r"\b[A-Za-z_]\w*(?=\s*\()"), func))
+        self.rules.append((re.compile(r"\b[A-Za-z_]\w*(?=\s*\\("), func))
         num = QTextCharFormat()
         num.setForeground(QColor("#d19a66"))
         self.rules.append((re.compile(r"\b\d+\.?\d*[fF]?\b"), num))
@@ -896,11 +906,16 @@ class ExampleDialog(QDialog):
         animate_window_open(self)
 
     def selectedCode(self):
-        """返回 (示例名, 代码)：示例名直接当保存时的默认文件名"""
-        row = self.list.currentRow()
-        if 0 <= row < len(self.items):
-            with open(self.items[row][1], "r", encoding="utf-8", errors="ignore") as f:
-                return self.items[row][2], f.read()
+        """返回 (示例名, 代码)：示例名直接当保存时的默认文件名。
+        关键：用 currentItem() 反查全量列表——搜索过滤后 currentRow()
+        返回的是“可见行号”，跟 self.items 的原始索引会错位，绝不能再用行号取值。"""
+        item = self.list.currentItem()
+        if item is None:
+            return "", ""
+        for it, code, d, first in self.items:
+            if it is item:
+                with open(code, "r", encoding="utf-8", errors="ignore") as f:
+                    return d, f.read()
         return "", ""
 
 # ==================== 主窗口 ====================
@@ -963,8 +978,7 @@ class MainWindow(QMainWindow):
         self.sendEdit.setPlaceholderText("给板子发指令（回车发送；末尾自动加换行）")
         self.sendEdit.setEnabled(False)
         self.sendEdit.returnPressed.connect(self.sendSerial)
-        self.sendNlCheck = QPushButton("换行 ✔")
-        self.sendNlCheck.setCheckable(True)
+        self.sendNlCheck = QCheckBox("自动加换行")
         self.sendNlCheck.setChecked(True)
         self.sendNlCheck.setToolTip("发送时末尾自动加换行（板子一般按行读取）")
         sendBtn = QPushButton("发送")
@@ -1161,13 +1175,17 @@ class MainWindow(QMainWindow):
 
     def autosave(self):
         """静默自动保存：只存「已命名且内容有改动」的标签。
-        不弹窗、不自动起名、不改标签名——未命名的新手文件等他自己点保存。"""
+        不弹窗、不自动起名、不改标签名——未命名的新手文件等他自己点保存。
+        对「还没命名但有内容」的标签：只在状态栏提个醒，绝不擅自起名。"""
+        unnamed = 0
         for i in range(self.tabs.count()):
             w = self.tabs.widget(i)
             if w is None:
                 continue
             p = getattr(w, "filePath", None)
             if not p or not os.path.isfile(p):
+                if w.toPlainText().strip():
+                    unnamed += 1
                 continue
             try:
                 with open(p, "r", encoding="utf-8", errors="ignore") as f:
@@ -1176,6 +1194,9 @@ class MainWindow(QMainWindow):
                             f2.write(w.toPlainText())
             except OSError:
                 pass
+        if unnamed and hasattr(self, "statusLabel"):
+            self.statusLabel.setText(
+                f"⚠ 有 {unnamed} 个文件还没保存（点「保存」起个名字，防止丢内容）")
 
     def closeTab(self, idx):
         ed = self.tabs.widget(idx)
@@ -1532,7 +1553,8 @@ class MainWindow(QMainWindow):
 
         env = os.environ.copy()
         env["PLATFORMIO_CORE_DIR"] = PLATFORMIO_CORE_DIR
-        env["PATH"] = env.get("PATH", "") + r";D:\Git\cmd"
+        if GIT_CMD_DIR:
+            env["PATH"] = env.get("PATH", "") + ";" + GIT_CMD_DIR
         # 国内镜像，避免 pio 装 Python 依赖时连 pypi.org 超时
         env["PIP_INDEX_URL"] = "https://pypi.tuna.tsinghua.edu.cn/simple"
         env["UV_INDEX_URL"] = "https://pypi.tuna.tsinghua.edu.cn/simple"
