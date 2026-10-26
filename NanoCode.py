@@ -16,16 +16,17 @@ from PySide6.QtWidgets import (
     QCompleter, QComboBox, QCheckBox, QLabel, QVBoxLayout, QHBoxLayout,
     QWidget, QFileDialog, QMessageBox, QLineEdit, QPushButton, QSplitter,
     QStyledItemDelegate, QListWidget, QListWidgetItem, QDialog, QStyle,
-    QGraphicsOpacityEffect, QInputDialog, QTabWidget, QTabBar, QMenu
+    QGraphicsOpacityEffect, QInputDialog, QTabWidget, QTabBar, QMenu,
+    QToolTip
 )
 from PySide6.QtGui import (
     QFont, QColor, QTextCharFormat, QSyntaxHighlighter, QPainter,
     QTextFormat, QKeySequence, QAction, QTextCursor, QIcon, QLinearGradient,
-    QStandardItemModel, QStandardItem
+    QStandardItemModel, QStandardItem, QShortcut
 )
 from PySide6.QtCore import (
     Qt, QStringListModel, QProcess, QRect, QSize, QUrl, QTimer, QRectF,
-    QPropertyAnimation
+    QPropertyAnimation, QPoint
 )
 
 from PySide6.QtSerialPort import QSerialPort, QSerialPortInfo
@@ -36,6 +37,36 @@ import keywords as KW
 ERR_RE = re.compile(
     r"((?:[A-Za-z]:[\\/])?[^:\s]+\.(?:cpp|ino|h))\s*:\s*(\d+)\s*(?::\s*(\d+))?\s*:\s*(error|warning|fatal error):\s*(.*)",
     re.I)
+
+# 常见英文报错 → 中文人话。新手看到英文报错就懵，直接翻译成“少了分号”这种大白话
+ERR_CN = [
+    (re.compile(r"expected ';'", re.I), "这里少了分号 ;"),
+    (re.compile(r"expected '}'", re.I), "这里少了右花括号 }（多半是 { 没配对）"),
+    (re.compile(r"expected '\)'", re.I), "这里少了右括号 )"),
+    (re.compile(r"expected '\]'", re.I), "这里少了右方括号 ]"),
+    (re.compile(r"expected (identifier|declaration|unqualified-id)", re.I),
+     "缺东西了：多半是少了分号、括号没写完整，或者单词拼错了"),
+    (re.compile(r"undeclared identifier", re.I), "这个单词没定义——多半是拼错了"),
+    (re.compile(r"not declared in this scope", re.I),
+     "这个词没声明过——检查是不是拼错、大小写不对，或者忘了声明"),
+    (re.compile(r"does not name a type", re.I), "这个类型不存在——多半是单词拼错了"),
+    (re.compile(r"redefinition of", re.I), "重复定义了同一个名字（写了两遍）"),
+    (re.compile(r"multiple definition", re.I), "同一个东西被定义了多次"),
+    (re.compile(r"no matching function", re.I), "函数名或参数不对——检查名字、参数个数和类型"),
+    (re.compile(r"invalid conversion", re.I), "类型不对（比如把小数塞给了整数变量）"),
+    (re.compile(r"cannot convert", re.I), "类型不能互相转换（参数类型对不上）"),
+    (re.compile(r"undefined reference", re.I), "链接失败：只写了函数名没写内容（或拼写不一致）"),
+    (re.compile(r"stray '\\' in program", re.I), "多了一个反斜杠 \（要么没有要么用两个）"),
+    (re.compile(r"expected constructor", re.I), "少了个分号，或括号没配对"),
+    (re.compile(r"was not declared", re.I), "没声明就用——检查拼写或先声明"),
+]
+
+def translate_error(msg):
+    """把一条英文报错翻译成中文大白话；翻译不了就返回 None"""
+    for pat, cn in ERR_CN:
+        if pat.search(msg):
+            return cn
+    return None
 
 # ==================== 路径配置（可在下边改，默认 D 盘） ====================
 PIO_EXE = r"D:\platformio-core\penv\Scripts\pio.exe"
@@ -139,7 +170,9 @@ def fuzzy_score(pattern, word):
     else:
         idx = w.find(p)
         if idx >= 0:
-            s = 60 - idx * 0.4 - len(w) * 0.05
+            # 中间包含：碰巧夹在词中间的（如 pref.begin 里的 pin）得分压低，
+            # 免得“只想找 pinMode”时冒出一堆无关的库函数
+            s = 45 - idx * 0.4 - len(w) * 0.05
         else:
             last = -1
             cnt = 0
@@ -207,14 +240,44 @@ def build_completion_list(pattern):
             seen.add(name)
             results.append((name, "（自动扫描到的函数）", s, KIND_FUNC))
     results.sort(key=lambda x: (-x[2], len(x[0])))
-    out = results[:12]
+    if not results:
+        out = []
+    else:
+        # 降噪：和第一名差太多（>=30 分）的候选直接砍掉。
+        # 例：输入 pM 时 pinMode 72 分、EEPROM 只有 34 分 → EEPROM 不再混进来
+        best = results[0][2]
+        keep = [r for r in results if best - r[2] < 30]
+        out = keep[:12]
     if len(_COMPLETION_CACHE) > 300:
         _COMPLETION_CACHE.clear()
     _COMPLETION_CACHE[key] = out
     return out
 
+
+def build_hot_list():
+    """什么也没输入时（Ctrl+空格）弹出的“常用词”列表：
+    只列新手最常打的那批（HOT 词库里有中文说明的）"""
+    seen = set()
+    hot = []
+    for group in (KW.CORE_KEYWORDS, KW.ARDUINO_KEYWORDS):
+        for name, desc in group:
+            if name in HOT and name not in seen:
+                seen.add(name)
+                hot.append((name, desc, 999 - len(hot), completion_kind(name)))
+    return hot[:12]
+
 # ==================== C++ 语法高亮 ====================
 class CppHighlighter(QSyntaxHighlighter):
+    # 类型 / 常量 / 宏 三张专色表：跟关键字、函数分开，一眼分清种类
+    TYPES = {"void", "int", "float", "double", "char", "bool", "long",
+             "short", "unsigned", "signed", "byte", "String", "const",
+             "static", "uint8_t", "uint16_t", "uint32_t", "int8_t",
+             "int16_t", "int32_t", "size_t", "auto", "struct", "class"}
+    CONSTS = {"HIGH", "LOW", "INPUT", "OUTPUT", "INPUT_PULLUP",
+              "INPUT_PULLDOWN", "true", "false", "NULL", "nullptr",
+              "RISING", "FALLING", "CHANGE", "ON", "OFF"}
+    MACROS = {"LED_BUILTIN", "ARDUINO", "ESP32", "ESP8266", "PI", "TAU"}
+
     def __init__(self, parent):
         super().__init__(parent)
         self.rules = []
@@ -223,27 +286,61 @@ class CppHighlighter(QSyntaxHighlighter):
         kw.setFontWeight(QFont.Bold)
         self.rules.append((re.compile(
             r"\b(" + "|".join(k for k, _ in KW.CORE_KEYWORDS) + r")\b"), kw))
+        ty = QTextCharFormat()
+        ty.setForeground(QColor("#56b6c2"))          # 类型：青色（int/float/…）
+        self.rules.append((re.compile(
+            r"\b(" + "|".join(sorted(self.TYPES)) + r")\b"), ty))
+        cs = QTextCharFormat()
+        cs.setForeground(QColor("#e5c07b"))          # 常量：金色（HIGH/LOW/…）
+        self.rules.append((re.compile(
+            r"\b(" + "|".join(sorted(self.CONSTS)) + r")\b"), cs))
+        mc = QTextCharFormat()
+        mc.setForeground(QColor("#f97583"))          # 宏：粉红（LED_BUILTIN/…）
+        self.rules.append((re.compile(
+            r"\b(" + "|".join(sorted(self.MACROS)) + r")\b"), mc))
         func = QTextCharFormat()
-        func.setForeground(QColor("#61afef"))
+        func.setForeground(QColor("#61afef"))        # 函数：蓝色
         self.rules.append((re.compile(r"\b[A-Za-z_]\w*(?=\s*\()"), func))
         num = QTextCharFormat()
-        num.setForeground(QColor("#d19a66"))
+        num.setForeground(QColor("#d19a66"))         # 数字：橙色
         self.rules.append((re.compile(r"\b\d+\.?\d*[fF]?\b"), num))
         st = QTextCharFormat()
-        st.setForeground(QColor("#98c379"))
+        st.setForeground(QColor("#98c379"))          # 字符串：绿色
         self.rules.append((re.compile(r"\"[^\"\\]*(\\.[^\"\\]*)*\""), st))
         self.rules.append((re.compile(r"'[^'\\]*(\\.[^'\\]*)*'"), st))
         com = QTextCharFormat()
-        com.setForeground(QColor("#7f848e"))
+        com.setForeground(QColor("#7f848e"))         # 注释：灰色
         self.rules.append((re.compile(r"//[^\n]*"), com))
+        self.commentFmt = com
+        # 单行块注释 /* ... */（跨行由 highlightBlock 的状态机处理）
+        self.rules.append((re.compile(r"/\*.*?\*/"), com))
         pre = QTextCharFormat()
-        pre.setForeground(QColor("#e06c75"))
+        pre.setForeground(QColor("#f97583"))         # 预处理 #include：粉红
         self.rules.append((re.compile(r"^\s*#\w+"), pre))
 
     def highlightBlock(self, text):
+        # 跨行注释状态机：上一行 /* 没闭合 → 本行开头先找 */
+        state = self.previousBlockState()
+        offset = 0
+        if state == 1:
+            end = text.find("*/")
+            if end >= 0:
+                self.setFormat(0, end + 2, self.commentFmt)
+                offset = end + 2
+            else:
+                self.setFormat(0, len(text), self.commentFmt)
+                self.setCurrentBlockState(1)
+                return
         for pattern, fmt in self.rules:
-            for m in pattern.finditer(text):
-                self.setFormat(m.start(), m.end() - m.start(), fmt)
+            for m in pattern.finditer(text[offset:]):
+                self.setFormat(offset + m.start(), m.end() - m.start(), fmt)
+        # 本行从 offset 之后如果有没闭合的 /* → 下一行还是注释
+        body = text[offset:]
+        i = body.rfind("/*")
+        if i >= 0 and "*/" not in body[i + 2:]:
+            self.setCurrentBlockState(1)
+        else:
+            self.setCurrentBlockState(0)
 
 # ==================== 补全弹窗（PyCharm 风格：类型徽标 + 名字 + 中文说明 + 右侧类型） ====================
 class TwoLineDelegate(QStyledItemDelegate):
@@ -407,9 +504,28 @@ class CodeEditor(QPlainTextEdit):
         if comp in KW.SNIPPETS:
             # 固定句式：自动补齐括号 + 分号 + 缩进，光标停在第 1 个空位
             self._insertSnippet(KW.SNIPPETS[comp])
+            self._showParamHint(comp)
             return
         extra = comp[len(prefix):] if comp.startswith(prefix) else comp
         self.textCursor().insertText(extra)
+        self._showParamHint(comp)
+
+    def _showParamHint(self, comp):
+        """补全后光标停住的地方浮一个小提示：这个词是干嘛的、怎么用。
+        中文说明直接来自词库，新手照着填就行"""
+        desc = ""
+        for group in (KW.CORE_KEYWORDS, KW.ARDUINO_KEYWORDS):
+            for name, d in group:
+                if name == comp:
+                    desc = d
+                    break
+            if desc:
+                break
+        if not desc:
+            return
+        cur = self.cursorRect()
+        pos = self.mapToGlobal(cur.bottomLeft() + QPoint(8, 8))
+        QToolTip.showText(pos, desc, self)
 
     def _insertSnippet(self, snippet):
         """插入代码模板：删掉刚输入的前缀，填完整句式，光标停在第 1 个占位处。
@@ -504,6 +620,13 @@ class CodeEditor(QPlainTextEdit):
         if e.key() == Qt.Key_Space and (e.modifiers() & Qt.ControlModifier):
             self.triggerCompletion()
             return
+        if e.key() == Qt.Key_Slash and (e.modifiers() & Qt.ControlModifier):
+            self.toggleComment()
+            return
+        if e.key() in (Qt.Key_ParenLeft, Qt.Key_BracketLeft, Qt.Key_BraceLeft) \
+                and not (e.modifiers() & (Qt.ControlModifier | Qt.AltModifier)):
+            self._autoPair(e.key())
+            return
         if e.key() in (Qt.Key_Equal, Qt.Key_Plus) and (e.modifiers() & Qt.ControlModifier):
             self._zoomFont(1)
             return
@@ -570,6 +693,57 @@ class CodeEditor(QPlainTextEdit):
             b = b.next()
         c.endEditBlock()
 
+    def _autoPair(self, key):
+        """打 ( [ { 时自动补上配对的 ) ] }，光标停在中间；
+        选中了文字就用括号把选中内容整个包起来"""
+        pair = {Qt.Key_ParenLeft: "()", Qt.Key_BracketLeft: "[]",
+                Qt.Key_BraceLeft: "{}"}
+        tc = self.textCursor()
+        if tc.hasSelection():
+            t = tc.selectedText()
+            tc.insertText(pair[key][0] + t + pair[key][1])
+            self.setTextCursor(tc)
+            return
+        tc.insertText(pair[key][0] + pair[key][1])
+        tc.movePosition(QTextCursor.Left)
+        self.setTextCursor(tc)
+
+    def toggleComment(self):
+        """Ctrl+/：给选中（或当前）的每行代码加上 // 注释；
+        再按一次就把 // 去掉（取消注释）。调试时快速开关一段代码"""
+        tc = self.textCursor()
+        start = tc.selectionStart()
+        end = tc.selectionEnd()
+        doc = self.document()
+        sb = doc.findBlock(start)
+        eb = doc.findBlock(end)
+        if end == eb.position() and eb != sb:
+            eb = eb.previous()   # 选区止于行首 → 那行不算
+        blocks = []
+        b = sb
+        while True:
+            blocks.append(b)
+            if b == eb:
+                break
+            b = b.next()
+        all_commented = all(re.match(r"^\s*//", bl.text()) for bl in blocks)
+        c = QTextCursor(doc)
+        c.beginEditBlock()
+        for bl in blocks:
+            cur = QTextCursor(bl)
+            t = bl.text()
+            if all_commented:
+                m = re.search(r"//", t)
+                if m:
+                    cur.setPosition(bl.position() + m.start())
+                    cur.setPosition(bl.position() + m.end(), QTextCursor.KeepAnchor)
+                    cur.removeSelectedText()
+            else:
+                indent = re.match(r"^\s*", t).group(0)
+                cur.setPosition(bl.position() + len(indent))
+                cur.insertText("// ")
+        c.endEditBlock()
+
     def autoIndent(self):
         """回车换行：跟着缩进走。{ / else / do / case / default → 进一级；} → 退一级"""
         tc = self.textCursor()
@@ -610,10 +784,11 @@ class CodeEditor(QPlainTextEdit):
     def triggerCompletion(self):
         prefix = self.currentWord()
         if not prefix:
-            if self.completer:
-                self.completer.popup().hide()
-            return
-        candidates = build_completion_list(prefix)
+            # 空行 / 光标前没有单词时：Ctrl+空格 弹“常用词”列表，方便新手翻着看
+            candidates = build_hot_list()
+            prefix = ""
+        else:
+            candidates = build_completion_list(prefix)
         if not candidates:
             self.completer.popup().hide()
             return
@@ -688,6 +863,28 @@ class CodeEditor(QPlainTextEdit):
                 sel.cursor = QTextCursor(block)
                 sel.cursor.clearSelection()
                 selections.append(sel)
+        # 查找/替换 Ctrl+F 的命中处：黄色底，一眼看到所有匹配
+        for (s, e2) in getattr(self, "_findSelections", []):
+            sel = QTextEdit.ExtraSelection()
+            sel.format.setBackground(QColor("#3a3a20"))
+            sel.format.setForeground(QColor("#e6e6e6"))
+            cur = QTextCursor(self.document())
+            cur.setPosition(s)
+            cur.setPosition(e2, QTextCursor.KeepAnchor)
+            sel.cursor = cur
+            selections.append(sel)
+        # 括号配对：光标旁边的括号 + 它配对的另一个，金色高亮
+        pair = self._pairBrackets()
+        if pair:
+            for p in pair:
+                sel = QTextEdit.ExtraSelection()
+                sel.format.setForeground(QColor("#e5c07b"))
+                sel.format.setBackground(QColor("#3e4451"))
+                cur = QTextCursor(self.document())
+                cur.setPosition(p)
+                cur.setPosition(p + 1, QTextCursor.KeepAnchor)
+                sel.cursor = cur
+                selections.append(sel)
         self.setExtraSelections(selections)
 
     def setErrorLines(self, lines):
@@ -697,6 +894,55 @@ class CodeEditor(QPlainTextEdit):
     def setSemiLines(self, lines):
         self.semiLines = list(lines)
         self.highlightCurrentLine()
+
+    def setFindMatches(self, spans):
+        """查找栏把命中位置存进来（(起点, 终点) 列表），高亮立刻刷新。
+        传 None/空 就清掉高亮"""
+        self._findSelections = list(spans) if spans else []
+        self.highlightCurrentLine()
+
+    def _pairBrackets(self):
+        """找光标旁边成对的括号：光标后是开括号，或光标前是闭括号时，
+        返回 (开括号位置, 闭括号位置)；没有就返回 None"""
+        tc = self.textCursor()
+        pos = tc.position()
+        doc = self.document()
+        text = doc.toPlainText()
+        if len(text) > 20000:
+            return None   # 文件太大就跳过，免得每次光标动都扫全文卡住
+        for ch in "([{":
+            if pos < len(text) and text[pos] == ch:
+                return self._findMatch(text, pos, ch)
+        for ch in ")]}":
+            if pos > 0 and text[pos - 1] == ch:
+                return self._findMatch(text, pos - 1, ch)
+        return None
+
+    def _findMatch(self, text, pos, ch):
+        """从一个括号出发找它的配对：开括号向后扫、闭括号向前扫，
+        遇到同向括号就 +1，遇到反向括号就 -1，归零即配对成功"""
+        if ch in "([{":
+            close = ")]}"["([{".index(ch)]
+            depth = 0
+            for i in range(pos, len(text)):
+                if text[i] == ch:
+                    depth += 1
+                elif text[i] == close:
+                    depth -= 1
+                    if depth == 0:
+                        return (pos, i)
+            return None
+        else:
+            open_ = "([{"[")]}".index(ch)]
+            depth = 0
+            for i in range(pos, -1, -1):
+                if text[i] == ch:
+                    depth += 1
+                elif text[i] == open_:
+                    depth -= 1
+                    if depth == 0:
+                        return (i, pos)
+            return None
 
     def findMissingSemicolons(self):
         """扫描全文，找出‘可能漏了分号 ; ’的行（大白话启发式检查，不是编译器）"""
@@ -1028,6 +1274,44 @@ class MainWindow(QMainWindow):
         ql.addWidget(btnClear)
         ql.addStretch(1)
 
+        # ---- 查找/替换栏（Ctrl+F 呼出，默认隐藏） ----
+        self.findBar = QWidget()
+        fb = QHBoxLayout(self.findBar)
+        fb.setContentsMargins(10, 4, 10, 4)
+        fb.setSpacing(6)
+        self.findEdit = QLineEdit()
+        self.findEdit.setPlaceholderText("查找…")
+        self.findEdit.setMaximumWidth(220)
+        self.findEdit.textChanged.connect(self.onFindTextChanged)
+        self.findEdit.returnPressed.connect(self.findNext)
+        btnPrev = QPushButton("上一个")
+        btnPrev.clicked.connect(self.findPrev)
+        btnNext = QPushButton("下一个")
+        btnNext.clicked.connect(self.findNext)
+        self.repEdit = QLineEdit()
+        self.repEdit.setPlaceholderText("替换为…")
+        self.repEdit.setMaximumWidth(160)
+        btnRep = QPushButton("替换")
+        btnRep.clicked.connect(self.replaceOne)
+        btnRepAll = QPushButton("全部替换")
+        btnRepAll.clicked.connect(self.replaceAll)
+        self.findStateLabel = QLabel("")
+        self.findStateLabel.setStyleSheet("color:#9aa0aa;")
+        btnCloseF = QPushButton("×")
+        btnCloseF.setMaximumWidth(30)
+        btnCloseF.clicked.connect(self.closeFindBar)
+        fb.addWidget(QLabel("查找:"))
+        fb.addWidget(self.findEdit)
+        fb.addWidget(btnPrev)
+        fb.addWidget(btnNext)
+        fb.addWidget(self.repEdit)
+        fb.addWidget(btnRep)
+        fb.addWidget(btnRepAll)
+        fb.addWidget(self.findStateLabel)
+        fb.addStretch(1)
+        fb.addWidget(btnCloseF)
+        self.findBar.hide()
+
         # ---- 底部状态栏 ----
         status = QWidget()
         sl = QHBoxLayout(status)
@@ -1041,6 +1325,7 @@ class MainWindow(QMainWindow):
         vv.setContentsMargins(0, 0, 0, 0)
         vv.setSpacing(0)
         vv.addWidget(quick)
+        vv.addWidget(self.findBar)
         vv.addWidget(splitter, 1)
         vv.addWidget(status)
         self.setCentralWidget(central)
@@ -1062,6 +1347,7 @@ class MainWindow(QMainWindow):
         self._add(tb, "停止", "停止正在进行的编译/烧录", self.stopProc)
         self._add(tb, "串口", "打开/关闭串口监视", self.toggleSerial)
 
+        QShortcut(QKeySequence("Ctrl+F"), self, activated=self.showFindBar)
         self.refreshPorts()
 
     @property
@@ -1365,6 +1651,123 @@ class MainWindow(QMainWindow):
             self.projectDir = d
             self.projectEdit.setText(d)
 
+    # ---------- 查找 / 替换（Ctrl+F） ----------
+    def showFindBar(self):
+        self.findBar.show()
+        self.findEdit.setFocus()
+        self.findEdit.selectAll()
+        if self.findEdit.text():
+            self._refreshFindHighlight()
+            self.findNext()
+
+    def closeFindBar(self):
+        self.findBar.hide()
+        self._findMatches = []
+        ed = self.editor
+        if ed is not None:
+            ed.setFindMatches([])
+
+    def onFindTextChanged(self, text):
+        self._refreshFindHighlight()
+        self.findNext()
+
+    def _collectMatches(self, term):
+        """扫一遍全文，返回所有 (起点, 终点) 命中位置"""
+        ed = self.editor
+        if ed is None or not term:
+            return []
+        doc = ed.document()
+        matches = []
+        tc = QTextCursor(doc)
+        tc.movePosition(QTextCursor.Start)
+        while True:
+            tc = doc.find(term, tc)
+            if tc.isNull():
+                break
+            matches.append((tc.selectionStart(), tc.selectionEnd()))
+            tc.setPosition(tc.selectionEnd())
+        return matches
+
+    def _refreshFindHighlight(self):
+        ed = self.editor
+        if ed is None:
+            return
+        term = self.findEdit.text()
+        matches = self._collectMatches(term)
+        self._findMatches = matches
+        ed.setFindMatches(matches)
+        self.findStateLabel.setText(f"共 {len(matches)} 处")
+
+    def _gotoMatch(self, ed, s, e2):
+        tc = QTextCursor(ed.document())
+        tc.setPosition(s)
+        tc.setPosition(e2, QTextCursor.KeepAnchor)
+        ed.setTextCursor(tc)
+        ed.centerCursor()
+
+    def findNext(self):
+        matches = getattr(self, "_findMatches", [])
+        ed = self.editor
+        if ed is None or not matches:
+            return False
+        pos = ed.textCursor().position()
+        for (s, e2) in matches:
+            if s > pos:
+                self._gotoMatch(ed, s, e2)
+                return True
+        self._gotoMatch(ed, matches[0][0], matches[0][1])
+        return True
+
+    def findPrev(self):
+        matches = getattr(self, "_findMatches", [])
+        ed = self.editor
+        if ed is None or not matches:
+            return False
+        pos = ed.textCursor().position()
+        for (s, e2) in reversed(matches):
+            if e2 < pos:
+                self._gotoMatch(ed, s, e2)
+                return True
+        self._gotoMatch(ed, matches[-1][0], matches[-1][1])
+        return True
+
+    def replaceOne(self):
+        """替换当前这一处：光标正好选中匹配就换，否则先跳到下一个再换"""
+        term = self.findEdit.text()
+        rep = self.repEdit.text()
+        ed = self.editor
+        if ed is None or not term:
+            return
+        cur = ed.textCursor()
+        if cur.hasSelection() and cur.selectedText() == term:
+            cur.insertText(rep)
+            ed.setTextCursor(cur)
+            self._refreshFindHighlight()
+            self.findNext()
+        else:
+            if self.findNext():
+                self.replaceOne()
+
+    def replaceAll(self):
+        """全部替换：从文档开头挨个替换，一次完成"""
+        term = self.findEdit.text()
+        rep = self.repEdit.text()
+        ed = self.editor
+        if ed is None or not term:
+            return
+        tc = QTextCursor(ed.document())
+        tc.beginEditBlock()
+        cnt = 0
+        while True:
+            tc = ed.document().find(term, tc)
+            if tc.isNull():
+                break
+            tc.insertText(rep)
+            cnt += 1
+        tc.endEditBlock()
+        self.statusLabel.setText(f"已全部替换 {cnt} 处")
+        self._refreshFindHighlight()
+
     def loadExampleByName(self, name):
         code = os.path.join(EXAMPLES_DIR, name, "main.cpp")
         if os.path.isfile(code):
@@ -1405,6 +1808,10 @@ class MainWindow(QMainWindow):
         if ed.semiLines:
             ed.semiLines = []
             ed.highlightCurrentLine()
+        # 文本变了，旧查找命中位置也失效（清掉高亮）
+        if getattr(ed, "_findSelections", None):
+            ed.setFindMatches([])
+            self._findMatches = []
         tc = ed.textCursor()
         block = tc.block().text()
         rel = tc.position() - tc.block().position()
@@ -1634,9 +2041,11 @@ class MainWindow(QMainWindow):
                 fname, ln, col, kind, msg = m.group(1), int(m.group(2)), m.group(3), m.group(4), m.group(5).strip()
                 if kind == "error" or kind == "fatal error":
                     self.errorLines.append(ln)
+                    cn = translate_error(msg)
+                    show_msg = f"{cn}（原文：{msg}）" if cn else msg
                     self.output.append(
                         f"<a style='color:#e06c75;text-decoration:none' href='{ln}'>"
-                        f"✘ 第 {ln} 行：{msg}</a>")
+                        f"✘ 第 {ln} 行：{show_msg}</a>")
                 else:
                     self.output.append(
                         f"<span style='color:#d19a66'>⚠ 第 {ln} 行（警告）：{msg}</span>")
