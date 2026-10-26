@@ -56,7 +56,7 @@ ERR_CN = [
     (re.compile(r"invalid conversion", re.I), "类型不对（比如把小数塞给了整数变量）"),
     (re.compile(r"cannot convert", re.I), "类型不能互相转换（参数类型对不上）"),
     (re.compile(r"undefined reference", re.I), "链接失败：只写了函数名没写内容（或拼写不一致）"),
-    (re.compile(r"stray '\\' in program", re.I), "多了一个反斜杠 \（要么没有要么用两个）"),
+    (re.compile(r"stray '\\' in program", re.I), "多了一个反斜杠 \\（要么没有要么用两个）"),
     (re.compile(r"expected constructor", re.I), "少了个分号，或括号没配对"),
     (re.compile(r"was not declared", re.I), "没声明就用——检查拼写或先声明"),
 ]
