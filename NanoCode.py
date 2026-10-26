@@ -33,6 +33,82 @@ from PySide6.QtSerialPort import QSerialPort, QSerialPortInfo
 
 import keywords as KW
 
+# ==================== Nano 电子实验室 · 桥接 ====================
+# 只依赖标准库；实验室没开时所有调用静默失败，不影响原有功能
+import json as _lab_json
+import queue as _lab_queue
+import threading as _lab_thread
+import urllib.request as _lab_urllib
+class LabClient:
+    BASE = "http://127.0.0.1:8765"
+    def __init__(self):
+        self.online = False
+        self._since = 0
+        self._busy = False
+        self._inbox = _lab_queue.Queue()
+    def _req(self, path, payload=None, timeout=1.5):
+        data = None
+        headers = {}
+        if payload is not None:
+            data = _lab_json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        req = _lab_urllib.Request(self.BASE + path, data=data, headers=headers,
+                                  method="POST" if payload is not None else "GET")
+        with _lab_urllib.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+        return _lab_json.loads(raw) if raw.strip() else {}
+    def probe(self):
+        try:
+            self.online = bool(self._req("/api/health", timeout=0.8).get("ok"))
+        except Exception:
+            self.online = False
+        return self.online
+    def send_code(self, code, board=None, filename="main.cpp"):
+        payload = {"code": code, "filename": filename or "main.cpp"}
+        if board:
+            payload["board"] = board
+        def work():
+            try:
+                self._req("/api/run", payload)
+            except Exception:
+                pass
+        _lab_thread.Thread(target=work, daemon=True).start()
+    def stop(self):
+        try:
+            self._req("/api/stop", {})
+        except Exception:
+            pass
+    def send_serial(self, text):
+        try:
+            self._req("/api/serial", {"text": text})
+        except Exception:
+            pass
+    # 串口输出：后台拉，主线程取
+    def poll_async(self):
+        if self._busy:
+            return
+        self._busy = True
+        _lab_thread.Thread(target=self._poll_once, daemon=True).start()
+    def _poll_once(self):
+        try:
+            data = self._req("/api/output?since=%d" % self._since, timeout=1.2)
+            for line in data.get("lines", []):
+                self._since = max(self._since, int(line.get("seq", 0)))
+                self._inbox.put(line)
+        except Exception:
+            pass
+        finally:
+            self._busy = False
+    def drain(self, limit=200):
+        out = []
+        while len(out) < limit:
+            try:
+                out.append(self._inbox.get_nowait())
+            except _lab_queue.Empty:
+                break
+        return out
+# ==============================================================
+
 # PlatformIO 报错格式：src\main.cpp:7:5: error: xxx（也可能是 D:\...\main.cpp 绝对路径）
 ERR_RE = re.compile(
     r"((?:[A-Za-z]:[\\/])?[^:\s]+\.(?:cpp|ino|h))\s*:\s*(\d+)\s*(?::\s*(\d+))?\s*:\s*(error|warning|fatal error):\s*(.*)",
@@ -72,6 +148,22 @@ def translate_error(msg):
 PIO_EXE = r"D:\platformio-core\penv\Scripts\pio.exe"
 PLATFORMIO_CORE_DIR = r"D:\platformio-core"
 DEFAULT_PROJECT = r"D:\PlatformIO\c3_blink"
+
+# PlatformIO 的 board 名 -> 电子实验室的板子 id（找不到就用实验室当前选中的板子）
+LAB_BOARD_MAP = {
+    "esp32-c3-devkitm-1": "esp32-c3-devkitm-1",
+    "esp32dev": "esp32-wroom-32-devkit-v1",
+    "esp32-s3-devkitc-1": "esp32-s3-devkitc-1",
+    "esp32-c6-devkitc-1": "esp32-c6-devkitc-1",
+    "nodemcuv2": "nodemcu-v3",
+    "d1_mini": "wemos-d1-mini",
+    "uno": "arduino-uno-r3",
+    "nanoatmega328": "arduino-nano",
+    "megaatmega2560": "arduino-mega2560",
+    "leonardo": "arduino-leonardo",
+    "pico": "raspberry-pi-pico",
+    "bluepill_f103c8": "stm32-blue-pill",
+}
 FRAMEWORK_CORES = r"D:\platformio-core\packages\framework-arduinoespressif32\cores\esp32"
 FRAMEWORK_LIBS = r"D:\platformio-core\packages\framework-arduinoespressif32\libraries"
 EXAMPLES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "examples")
@@ -1177,6 +1269,16 @@ class MainWindow(QMainWindow):
         self.serial = QSerialPort(self)
         self.serial.readyRead.connect(self.onSerialData)
 
+        self.lab = LabClient()
+        self._labPollTimer = QTimer(self)
+        self._labPollTimer.setInterval(500)
+        self._labPollTimer.timeout.connect(self.lab.poll_async)
+        self._labPollTimer.start()
+        self._labUiTimer = QTimer(self)
+        self._labUiTimer.setInterval(150)
+        self._labUiTimer.timeout.connect(self.drainLabOutput)
+        self._labUiTimer.start()
+
         # 自动保存：每 30 秒静默存一次所有已命名的文件（没起名的文件不自动命名）
         self._autosaveTimer = QTimer(self)
         self._autosaveTimer.setInterval(30000)
@@ -1346,6 +1448,7 @@ class MainWindow(QMainWindow):
         self._add(tb, "烧录", "编译并烧录到板子", self.upload)
         self._add(tb, "停止", "停止正在进行的编译/烧录", self.stopProc)
         self._add(tb, "串口", "打开/关闭串口监视", self.toggleSerial)
+        self._add(tb, "虚拟实验室", "把代码送到 Nano 电子实验室仿真（不用接板子）", self.runInLab)
 
         QShortcut(QKeySequence("Ctrl+F"), self, activated=self.showFindBar)
         self.refreshPorts()
@@ -1868,6 +1971,48 @@ class MainWindow(QMainWindow):
         anim.finished.connect(t.deleteLater)
         anim.start(QPropertyAnimation.DeleteWhenStopped)
 
+    # ---------- 虚拟实验室 ----------
+    def runInLab(self):
+        ed = self.editor
+        if ed is None:
+            QMessageBox.information(self, "虚拟实验室",
+                                    "先点「新建」或「示例」写点代码吧。")
+            return
+        code = ed.toPlainText()
+        if not code.strip():
+            self.toast("代码是空的", "#e5c07b")
+            return
+        if not self.lab.probe():
+            self.toast("Nano 电子实验室没启动：先双击桌面的 Nano 电子实验室", "#e5c07b", 6000)
+            self.statusLabel.setText("虚拟实验室未启动（不影响写代码）")
+            return
+        name = os.path.basename(getattr(ed, "filePath", "") or "") or "main.cpp"
+        self.lab.send_code(code, board=self.detectLabBoard(), filename=name)
+        self.output.append("<span style='color:#22d3ee'>◈ 已送到电子实验室：%s</span>" % name)
+        self.toast("已送到电子实验室", "#22d3ee")
+
+    def detectLabBoard(self):
+        ini = os.path.join(self.projectDir or "", "platformio.ini")
+        if not os.path.isfile(ini):
+            return None
+        try:
+            with open(ini, "r", encoding="utf-8", errors="ignore") as f:
+                text = f.read()
+        except OSError:
+            return None
+        m = re.search(r"(?m)^\s*board\s*=\s*(\S+)", text)
+        return LAB_BOARD_MAP.get(m.group(1).strip()) if m else None
+
+    def drainLabOutput(self):
+        for line in self.lab.drain():
+            text = str(line.get("text", ""))
+            stream = line.get("stream", "out")
+            color = "#f87171" if stream == "err" else ("#e5c07b" if stream in ("sys", "warn") else "#22d3ee")
+            self.output.append("<span style='color:%s'>[实验室] %s</span>"
+                               % (color, text.replace("<", "&lt;").replace(">", "&gt;")))
+        sb = self.output.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
     # ---------- 编译 / 烧录 ----------
     def build(self):
         self.runPio(["run"], "编译")
@@ -2173,6 +2318,11 @@ class MainWindow(QMainWindow):
         self.output.append(f"<span style='color:#61afef'>→ 发送: {shown}</span>")
         sb = self.output.verticalScrollBar()
         sb.setValue(sb.maximum())
+        try:
+            if self.lab.online:
+                self.lab.send_serial(text.rstrip("\n"))
+        except Exception:
+            pass
         self.sendEdit.clear()
 
     def onSerialData(self):
